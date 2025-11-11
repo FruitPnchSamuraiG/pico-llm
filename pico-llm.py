@@ -160,9 +160,23 @@ class KGramMLPSeqModel(nn.Module):
         self.num_inner_layers = num_inner_layers
         self.chunk_size = chunk_size
 
-        # fill in
+        # Initialize the layers of the MLP
+        layers = []
+        # Input dimension is k * vocab_size (one-hot for k tokens)
+        input_dim = self.k * self.vocab_size
 
-        self.net = None
+        # Add the (Linear -> SiLU) inner blocks
+        # num_inner_layers=1 means: 1 (Linear->SiLU) block + 1 output Linear
+        for _ in range(self.num_inner_layers):
+            layers.append(nn.Linear(input_dim, self.embed_size))
+            layers.append(nn.SiLU())
+            input_dim = self.embed_size
+
+        # Add the final output layer to get logits
+        layers.append(nn.Linear(input_dim, self.vocab_size))
+
+        # Set the current network as a sequential model of the above layers
+        self.net = nn.Sequential(*layers)
 
     def forward(self, tokens_seq):
         """
@@ -238,14 +252,99 @@ class LSTMSeqModel(nn.Module):
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
-        pass
+        self.dim = dim
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(self.dim))
+
+    def forward(self, x):
+        # Calculate the Root Mean Square of the input
+        # x.pow(2).mean(-1, keepdim=True) is the Mean Square
+        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        # Normalize x and apply scale
+        return (x / rms) * self.scale
+
+class Block(nn.Module):
+    """ A single Transformer block, as described in the blueprint. """
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        # Causal Self-Attention
+        self.norm1 = RMSNorm(d_model)
+        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=False)
+
+        # Feed-Forward Netowrk (MLP)
+        self.norm2 = RMSNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model), # Standard to expand 4x
+            nn.SiLU(), # Common activation function
+            nn.Linear(4 * d_model, d_model),
+        )
+
+    def forward(self, x, causal_mask):
+        """
+        x: (seq_len, batch, d_model)
+        causal_mask: (seq_len, seq_len)
+        return: (seq_len, batch, d_model)
+        """
+        # Attention with skip connection
+        norm_x = self.norm1(x)
+        # Note: self.attn(Q, K, V). We get Q, K, V from the *normalized* x.
+        attn_output, _ = self.attn(norm_x, norm_x, norm_x, attn_mask=causal_mask, need_weights=False)
+        x = x + attn_output
+
+        # MLP with skip connection
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 class TransformerModel(nn.Module):
     def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4):
         super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_blocks = n_blocks
 
-        pass
+        # Token embedding layer
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
 
+        # Stack of transformer blocks
+        self.blocks = nn.ModuleList([
+            Block(d_model, n_heads) for _ in range(n_blocks)
+        ])
+
+        # Final RMSNorm
+        self.final_norm = RMSNorm(d_model)
+
+        # Unembedding layer to produce logits
+        self.lm_head = nn.Linear(d_model, vocab_size)
+
+    def _create_causal_mask(self, seq_len, device):
+        # Create causal mask to prevent attention to future tokens
+        # This is the "causal" part of a "causal decoder-only transformer"
+        causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=device) * float('-inf'), diagonal=1)
+        return causal_mask
+
+    def forward(self, tokens_seq):
+        """
+        tokens_seq: (seq_len, batch)
+        return: (seq_len, batch, vocab_size)
+        """
+        seq_len, batch_size = tokens_seq.shape
+        device = tokens_seq.device
+
+        # Get token embeddings
+        x = self.token_embedding(tokens_seq)  # (seq_len, batch, d_model)
+
+        # Create causal mask
+        causal_mask = self._create_causal_mask(seq_len, device)
+
+        # Pass through transformer blocks
+        for block in self.blocks:
+            x = block(x, causal_mask)
+
+        # Final normalization and LM head to get logits
+        x = self.final_norm(x)                 # (seq_len, batch, d_model)
+        logits = self.lm_head(x)               # (seq_len, batch, vocab_size)
+        return logits
 
 ################################################################################
 # 6. K-Means Monosemantic (DISABLED by default)
@@ -261,7 +360,36 @@ def monosemantic_analysis_for_token(token_id, model, enc, device="cpu", top_n=5)
 ################################################################################
 
 def nucleus_sampling(logits, p=0.95):
-    return torch.argmax(logits).item()
+    if p >= 1.0:
+        # If p=1.0, just sample from the full distribution
+        probs = F.softmax(logits, dim=-1)
+    else:
+        # Get probabilities
+        probs = F.softmax(logits, dim=-1)
+        # Sort probabilities in descending order
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        # Find cumulative sum of the probabilities
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        # 4. Find the smallest set of tokens whose prob sum is >= p
+        # We create a mask for tokens to remove.
+        # Find indices where cumulative prob is > p
+        sorted_indices_to_remove = cumulative_probs > p
+        # We must keep at least one token. We shift the mask to the right
+        # so that the first token that crosses the threshold p
+        # is also removed.
+        sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+        # But we always keep the top token (index 0)
+        sorted_indices_to_remove[0] = False
+        # Create mask for original logits tensor
+        # We scatter the sorted_indices_to_remove back to original indices
+        indices_to_remove = torch.zeros_like(probs, dtype=torch.bool).scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+        # Remove the noise by setting their probabilities to zero
+        probs[indices_to_remove] = 0.0
+        # Renormalize the probabilities
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+    # Sample from the filtered distribution
+    next_token = torch.multinomial(probs, num_samples=1)
+    return next_token.item()
 
 
 def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
