@@ -160,6 +160,9 @@ class KGramMLPSeqModel(nn.Module):
         self.num_inner_layers = num_inner_layers
         self.chunk_size = chunk_size
 
+        # Token embedding layer
+        self.embedding = nn.Embedding(self.vocab_size, self.embed_size)
+
         # Initialize the layers of the MLP
         layers = []
         # Input dimension is k * vocab_size (one-hot for k tokens)
@@ -185,6 +188,30 @@ class KGramMLPSeqModel(nn.Module):
         We'll do a loop over time steps. chunk_size can reduce overhead.
         """
         seq_len, batch_size = tokens_seq.shape
+        # Using Embedding Layer
+        device = tokens_seq.device
+
+        # Transpose to (batch, seq_len) for easier processing
+        tokens = tokens_seq.transpose(0, 1)  # (batch, seq_len)
+
+        # Add padding of zeros at the beginning for positions < k
+        padded_tokens = F.pad(tokens, (self.k - 1, "constant", 0), value=0)  # (batch, seq_len + k - 1)
+
+        # Create a sliding window view of size k
+        unfolded_tokens = padded_tokens.unfold(dimension=1, size=self.k, step=1)  # (batch, seq_len, k)
+
+        # Create embeddings for each token in the k-grams
+        x = self.embedding(unfolded_tokens)  # (batch, seq_len, k, embed_size)
+
+        # Flatten the last two dimensions to create a single input vector for the MLP
+        x = x.flatten(start_dim=2)  # (batch, seq_len, k * embed_size)
+
+        # Pass through the MLP to get logits
+        logits = self.net(x)  # (batch, seq_len, vocab_size)
+
+        # Transpose back to (seq_len, batch, vocab_size)
+        return logits.transpose(0, 1)  # (seq_len, batch, vocab_size)
+        ''' Old Forward with one-hot (very memory heavy)
         outputs = []
 
         start = 0
@@ -215,6 +242,7 @@ class KGramMLPSeqModel(nn.Module):
 
         outputs = torch.cat(outputs, dim=0)  # (seq_len, batch, vocab_size)
         return outputs
+        '''
 
 
 ################################################################################
