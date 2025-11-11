@@ -85,9 +85,9 @@ class TransformerBlock(nn.Module):
         self.head_dim = d_model // n_heads  # Each head processes head_dim features
         
         # Multi-head attention projections
-        self.q_proj = nn.Linear(d_model, d_model)  # Query projection
-        self.k_proj = nn.Linear(d_model, d_model)  # Key projection
-        self.v_proj = nn.Linear(d_model, d_model)  # Value projection
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)  # Query projection
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)  # Key projection
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)  # Value projection
         self.out_proj = nn.Linear(d_model, d_model)  # Output projection
         
         # Feedforward network (MLP)

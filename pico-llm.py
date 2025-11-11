@@ -339,7 +339,7 @@ class KGramMLPSeqModel(nn.Module):
                     else:
                         context_ids = tokens_seq[t-self.k:t, b].tolist()
 
-                    # Embedding-based context representation (CPU-friendly)
+                    # Embedding-based context representation
                     ctx_ids_tensor = torch.tensor(context_ids, dtype=torch.long, device=tokens_seq.device)
                     ctx_emb = self.token_embed(ctx_ids_tensor)  # (k, embed_size)
                     context_flat = ctx_emb.flatten().unsqueeze(0)  # (1, k*embed_size)
@@ -506,9 +506,9 @@ class TransformerBlock(nn.Module):
         self.head_dim = d_model // n_heads  # Each head processes head_dim features
         
         # Multi-head attention projections
-        self.q_proj = nn.Linear(d_model, d_model)  # Query projection
-        self.k_proj = nn.Linear(d_model, d_model)  # Key projection
-        self.v_proj = nn.Linear(d_model, d_model)  # Value projection
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)  # Query projection
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)  # Key projection
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)  # Value projection
         self.out_proj = nn.Linear(d_model, d_model)  # Output projection
         
         # Feedforward network (MLP)
