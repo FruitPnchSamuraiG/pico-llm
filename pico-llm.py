@@ -1,51 +1,21 @@
-# starter code by matus & o1-pro
-# Extended implementation for CSCI-GA.2565 (NYU Deep Learning)
-# 
-# PURPOSE: Train and compare multiple language models from scratch on TinyStories dataset:
-#   1. K-gram MLP: Fixed-window feedforward model (baseline)
-#   2. LSTM: Recurrent model with hidden state (handles variable context)
-#   3. Transformer: Attention-based decoder-only model (state-of-the-art)
-#
-# KEY FEATURES:
-#   - Nucleus (top-p) sampling for diverse text generation
-#   - RMSNorm for stable training (used in LLaMA models)
-#   - Causal decoder-only Transformer with multi-head self-attention
-#   - CPU-friendly implementation with GPU scaling support
-#   - Model checkpointing and gradient clipping for stability
-#   - Flexible CLI for experimentation
+import argparse
+import time
+import random 
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim 
+import torch.nn.functional as F
 
-import argparse  # Parse command-line arguments
-import time  # Track generation intervals
-import random  # Random sampling and dataset shuffling
-import math  # sqrt for attention scaling
-import torch  # PyTorch core
-import torch.nn as nn  # Neural network modules
-import torch.optim as optim  # Optimizers (AdamW)
-import torch.nn.functional as F  # Functional API (softmax, cross_entropy, etc.)
-
-from datasets import load_dataset  # HuggingFace datasets (TinyStories)
-import tiktoken  # OpenAI's BPE tokenizer (GPT-2 vocab)
+from datasets import load_dataset
+import datasets
+import tiktoken 
 
 ################################################################################
 # 1. Command-line argument parsing
-#    Provides flexible configuration for all hyperparameters without code changes
 ################################################################################
 
 def parse_args():
-    """
-    Parse command-line arguments for training configuration.
-    
-    DESIGN DECISIONS:
-    - Default values chosen for reasonable CPU performance
-    - GPU users should increase: batch_size, train_subset_size, block_size, embed_size
-    - Transformer disabled by default (use --enable_transformer to activate)
-    
-    KEY HYPERPARAMETERS:
-    - block_size: Maximum sequence length (memory scales quadratically in Transformer!)
-    - embed_size: Hidden dimension (affects model capacity and memory)
-    - batch_size: Trade-off between gradient noise and memory
-    - learning_rate: Too high causes instability, too low slows convergence
-    """
     parser = argparse.ArgumentParser(description="Train multiple k-gram or sequence-based models on TinyStories and/or custom text files.")
     parser.add_argument("--input_files", nargs="*", default=None,
                         help="Optional list of text files to mix in as data sources. Each line is one example (up to block_size).")
@@ -85,10 +55,6 @@ def parse_args():
                         help="Number of epochs. Reduce on CPU, e.g., 1-2.")
     parser.add_argument("--learning_rate", type=float, default=1e-3,
                         help="Optimizer learning rate.")
-    parser.add_argument("--train_subset_size", type=int, default=20000,
-                        help="How many TinyStories samples to load. Reduce on CPU, e.g., 1000-5000.")
-    parser.add_argument("--sample_interval", type=int, default=30,
-                        help="Seconds between text samples during training.")
 
     # Transformer & model selection flags
     parser.add_argument("--enable_transformer", action="store_true", help="Enable training the Transformer model.")
@@ -101,38 +67,27 @@ def parse_args():
     # Training stability and quality improvements
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm. Prevents exploding gradients.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="L2 regularization weight decay for AdamW.")
-    parser.add_argument("--warmup_steps", type=int, default=100, help="Learning rate warmup steps for stable training.")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout probability for regularization.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    
+    # Validation split
+    parser.add_argument("--val_split", type=float, default=0.1, help="Fraction of data to use for validation (0.1 = 10%)")
 
     args = parser.parse_args()
     return args
 
 
 ################################################################################
-# 2. Data handling: Variable-length sequences with dynamic batching
-#    Core insight: We pad sequences to batch them efficiently while preserving
-#    the autoregressive structure needed for next-token prediction
+# 2. Data handling: entire sequences up to block_size => (seq_len, batch)
 ################################################################################
 
 class MixedSequenceDataset(torch.utils.data.Dataset):
     """
-    Custom dataset that mixes TinyStories and user-provided text files.
-    
-    ARCHITECTURE:
-    - Stores pre-tokenized sequences (not raw text) for efficiency
-    - Each sequence is <= block_size tokens
-    - At runtime, randomly samples from TinyStories vs custom data with probability p_tiny
-    
-    WHY THIS DESIGN?
-    - Allows flexible data mixing without reloading
-    - Enables domain-specific fine-tuning (e.g., mix fairy tales with code)
-    - Random sampling at __getitem__ provides natural data augmentation
-    
-    PARAMETERS:
-    - tinystories_seqs: List of tokenized TinyStories sequences
-    - other_seqs: List of tokenized custom file sequences  
-    - p_tiny: Probability [0,1] of sampling from TinyStories (vs custom data)
+    We store two lists of entire token sequences:
+      - tinystories_seqs
+      - other_seqs
+    Each sequence is length <= block_size.
+
+    During __getitem__, we randomly pick from one list or the other with probability p_tiny.
+    Return that entire sequence as a 1D LongTensor.
     """
     def __init__(self, tinystories_seqs, other_seqs, p_tiny: float):
         super().__init__()
@@ -171,20 +126,12 @@ class MixedSequenceDataset(torch.utils.data.Dataset):
 
 def seq_collate_fn(batch):
     """
-    Custom collation for variable-length sequences in a batch.
-    
-    PROBLEM: DataLoader expects uniform tensor shapes, but our sequences have different lengths
-    SOLUTION: Pad all sequences to max_len with zeros (token 0 is typically padding/unknown)
-    
-    INPUT: batch = [seq1, seq2, ...] where each seq is a 1D LongTensor
-    OUTPUT: (max_len, batch_size) padded tensor
-    
-    WHY (seq_len, batch) NOT (batch, seq_len)?
-    - PyTorch RNNs expect (seq_len, batch, features) by default when batch_first=False
-    - Consistent with LSTM convention used in LSTMSeqModel
-    - Can transpose if needed (Transformer uses batch_first internally)
+    batch: list of 1D LongTensors of various lengths [<= block_size].
+    1) find max length
+    2) pad with zeros
+    3) shape => (max_len, batch_size)
     """
-    max_len = max(len(seq) for seq in batch)  # Find longest sequence
+    max_len = max(len(seq) for seq in batch)
     batch_size = len(batch)
 
     # Initialize with zeros (padding token)
@@ -193,39 +140,21 @@ def seq_collate_fn(batch):
     # Copy each sequence into the padded tensor
     for i, seq in enumerate(batch):
         seq_len = seq.size(0)
-        padded[:seq_len, i] = seq  # Fill column i with sequence
+        padded[:seq_len, i] = seq 
 
     return padded
 
 
 ################################################################################
-# 3. Loss computation: Next-token prediction with target shifting
-#    This is the fundamental objective for autoregressive language modeling
+# 4. K-gram MLP: Fixed-window feedforward baseline
+#    Simplest sequence model: predict next token from last k tokens
 ################################################################################
 
 def compute_next_token_loss(logits, tokens):
     """
-    Compute cross-entropy loss for next-token prediction.
-    
-    AUTOREGRESSIVE SETUP:
-    - Given tokens [t0, t1, t2, ..., tN]
-    - Model predicts: logits[i] = P(t_{i+1} | t0...ti)
-    - Loss: cross_entropy(logits[i], t_{i+1}) for all i
-    
-    IMPLEMENTATION:
-    - logits[:-1] are predictions (drop last timestep, no target for it)
-    - tokens[1:] are targets (shift left by 1)
-    - Flatten to (batch*seq_len, vocab) for efficient cross_entropy
-    
-    EDGE CASE:
-    - If seq_len < 2, no pairs to predict, return 0 loss
-    
-    PARAMETERS:
-    - logits: (seq_len, batch_size, vocab_size) - Model predictions
-    - tokens: (seq_len, batch_size) - Ground truth tokens
-    
-    RETURNS:
-    - Scalar tensor: average cross-entropy loss over all (token, target) pairs
+    logits: (seq_len, batch, vocab_size)
+    tokens: (seq_len, batch)
+    Next-token prediction => we shift target by 1.
     """
     seq_len, batch_size, vocab_size = logits.shape
     if seq_len < 2:
@@ -243,13 +172,6 @@ def compute_next_token_loss(logits, tokens):
     # Averaged over all positions
     return F.cross_entropy(preds, gold)
 
-
-################################################################################
-# 4. K-gram MLP: Fixed-window feedforward baseline
-#    Simplest sequence model: predict next token from last k tokens
-################################################################################
-
-
 class KGramMLPSeqModel(nn.Module):
     """
     K-gram MLP: Predict next token from fixed k-token history.
@@ -260,15 +182,6 @@ class KGramMLPSeqModel(nn.Module):
     3. Concatenate embeddings: (k * embed_size,)
     4. Pass through MLP: Linear -> SiLU -> ... -> Linear(vocab_size)
     5. Output: logits for next token
-    
-    LIMITATIONS:
-    - Fixed context window (can't see beyond k tokens)
-    - Processes each position independently (no parameter sharing across positions)
-    - Memory/compute scales linearly with sequence length
-    
-    OPTIMIZATIONS:
-    - Uses nn.Embedding instead of one-hot vectors (50k vocab one-hot is huge!)
-    - chunk_size: Process multiple timesteps together to reduce loop overhead
     
     PARAMETERS:
     - vocab_size: Number of unique tokens (GPT-2 = 50257)
@@ -286,7 +199,6 @@ class KGramMLPSeqModel(nn.Module):
         self.num_inner_layers = num_inner_layers
         self.chunk_size = chunk_size
 
-        # CPU-friendly: use embeddings instead of huge one-hot vectors
         # Why? 50k-dim one-hot = 200KB per token, 128-dim embedding = 512 bytes!
         self.token_embed = nn.Embedding(vocab_size, embed_size)
         
@@ -296,7 +208,7 @@ class KGramMLPSeqModel(nn.Module):
         hidden_dim = embed_size
         for _ in range(max(0, num_inner_layers)):
             layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.SiLU())  # Smooth activation (used in modern LLMs)
+            layers.append(nn.SiLU())  # Smooth activation
             in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, vocab_size))  # Final projection to logits
         self.net = nn.Sequential(*layers)
@@ -314,9 +226,6 @@ class KGramMLPSeqModel(nn.Module):
             2. Embed context tokens: (k, embed_size)
             3. Flatten: (k * embed_size,)
             4. MLP forward: (vocab_size,)
-        
-        WARNING: This is slow (nested loops) but correct. For production, use 
-        batched convolution or parallel processing.
         """
         seq_len, batch_size = tokens_seq.shape
         outputs = []
@@ -358,33 +267,17 @@ class KGramMLPSeqModel(nn.Module):
 
 
 ################################################################################
-# 5. LSTM: Recurrent baseline with hidden state
-#    Learns to compress variable-length context into fixed-size hidden state
+# 4. LSTM-based seq2seq
 ################################################################################
 
 class LSTMSeqModel(nn.Module):
     """
     LSTM: Long Short-Term Memory for sequence modeling.
     
-    KEY ADVANTAGE OVER K-GRAM:
-    - Variable-length context (hidden state summarizes entire history)
-    - Parameter sharing across positions (same LSTM cell processes all tokens)
-    - Learns what to remember/forget via gates
-    
     ARCHITECTURE:
     1. Embedding layer: token_id -> embed_size vector
     2. LSTM: processes sequence, maintains hidden state (h_t, c_t)
     3. Linear projection: hidden -> vocab_size logits
-    
-    WHY LSTM WORKS:
-    - Hidden state h_t = compressed summary of tokens[0:t]
-    - Cell state c_t = long-term memory (gradient highway)
-    - Gates control information flow (prevent vanishing gradients)
-    
-    LIMITATIONS:
-    - Sequential processing (can't parallelize across time)
-    - Struggles with very long sequences (hidden state bottleneck)
-    - Modern Transformers outperform on most tasks
     
     PARAMETERS:
     - vocab_size: Number of tokens
@@ -414,9 +307,6 @@ class LSTMSeqModel(nn.Module):
         2. LSTM processes sequence: output = (seq_len, batch, hidden_size)
            - At each step t, hidden state h_t depends on h_{t-1} and input
         3. Project to vocabulary: (seq_len, batch, vocab_size)
-        
-        NOTE: We output logits for ALL positions, but only use [:seq_len-1] 
-        for loss (since we're predicting next token).
         """
         emb = self.embedding(tokens_seq)   # (seq_len, batch, embed_size)
         self.lstm.flatten_parameters()     # Optimization for contiguous memory
@@ -427,26 +317,15 @@ class LSTMSeqModel(nn.Module):
 
 ################################################################################
 # 6. Transformer: Attention-based decoder-only model (GPT-style)
-#    State-of-the-art architecture for language modeling
 ################################################################################
 
 class RMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization (RMSNorm).
     
-    MOTIVATION:
-    - Simpler than LayerNorm (no mean subtraction, no bias)
-    - Used in LLaMA, GPT-NeoX, other modern LLMs
-    - Empirically works as well as LayerNorm with less computation
-    
     FORMULA:
     - RMS(x) = sqrt(mean(x^2) + eps)  # Root mean square
     - output = (x / RMS(x)) * weight  # Normalize and scale
-    
-    WHY IT WORKS:
-    - Normalizes variance to 1 (stabilizes training)
-    - Learnable weight allows model to control scale per dimension
-    - Eps prevents division by zero
     
     PARAMETERS:
     - dim: Feature dimension to normalize (last dimension)
@@ -481,11 +360,6 @@ class TransformerBlock(nn.Module):
     ARCHITECTURE (Pre-norm style):
     1. x = x + Attention(RMSNorm(x))  # Attention with residual
     2. x = x + FFN(RMSNorm(x))         # Feedforward with residual
-    
-    WHY PRE-NORM?
-    - Normalizes BEFORE attention/FFN (not after)
-    - More stable training for deep networks
-    - Used in GPT-2, GPT-3, LLaMA
     
     COMPONENTS:
     - Multi-head self-attention: Learn which tokens to attend to
@@ -590,16 +464,6 @@ class TransformerModel(nn.Module):
     4. Final RMSNorm
     5. Linear projection to vocabulary: d_model -> vocab_size
     
-    KEY FEATURES:
-    - Causal masking: Position i can only attend to positions <= i
-    - Autoregressive generation: Generate one token at a time
-    - Parallel training: All positions processed simultaneously
-    
-    WHY TRANSFORMERS DOMINATE:
-    - Parallelizable (unlike RNNs)
-    - Unlimited context (in theory, limited by memory in practice)
-    - Learns complex relationships via attention
-    
     PARAMETERS:
     - vocab_size: Number of tokens in vocabulary
     - d_model: Model dimension (hidden size)
@@ -654,10 +518,6 @@ class TransformerModel(nn.Module):
         4. Final normalization
         5. Project to vocabulary logits
         6. Transpose back to (seq_len, batch, vocab_size) for consistency
-        
-        CAUSAL PROPERTY:
-        - Logits at position i depend only on tokens [0:i]
-        - Enables autoregressive generation (predict token i+1 from [0:i])
         """
         seq_len, batch_size = tokens_seq.shape
         if seq_len > self.block_size:
@@ -687,8 +547,7 @@ class TransformerModel(nn.Module):
 
 
 ################################################################################
-# 7. Monosemantic Analysis (DISABLED by default)
-#    Placeholder for interpretability analysis
+# 6. K-Means Monosemantic (DISABLED by default)
 ################################################################################
 
 
@@ -697,19 +556,12 @@ def monosemantic_analysis_for_token(token_id, model, monosemantic_info, enc, dev
 
 
 ################################################################################
-# 8. Text generation with nucleus sampling
-#    Core algorithm for diverse, high-quality text generation
+# 7. Single code path for text generation
 ################################################################################
 
 def nucleus_sampling(logits, p=0.95):
     """
     Nucleus (top-p) sampling: Sample from smallest set of tokens with cumulative probability >= p.
-    
-    MOTIVATION:
-    - Greedy (argmax): Repetitive, boring text
-    - Pure random: Incoherent nonsense
-    - Top-k: Arbitrary cutoff, doesn't adapt to distribution shape
-    - Top-p (nucleus): Adaptive cutoff based on probability mass
     
     ALGORITHM:
     1. Convert logits to probabilities via softmax
@@ -717,18 +569,6 @@ def nucleus_sampling(logits, p=0.95):
     3. Compute cumulative probability mass
     4. Find smallest set of tokens with cumulative mass >= p
     5. Renormalize and sample from this "nucleus"
-    
-    EXAMPLE (p=0.9):
-    - Original probs: [0.5, 0.3, 0.15, 0.04, 0.01]
-    - Cumulative: [0.5, 0.8, 0.95, 0.99, 1.0]
-    - Nucleus (>= 0.9): first 3 tokens [0.5, 0.3, 0.15]
-    - Renormalize: [0.526, 0.316, 0.158]
-    - Sample from these 3 tokens
-    
-    WHY IT WORKS:
-    - Adapts to certainty: sharp distribution → few tokens, flat distribution → many tokens
-    - Prevents low-probability garbage while allowing diversity
-    - Used in GPT-3, ChatGPT, and most modern LLMs
     
     PARAMETERS:
     - logits: (vocab_size,) raw model outputs
@@ -866,7 +706,7 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
 
 
 ################################################################################
-# 9. Training loop: Gradient descent with logging and sampling
+# 8. Training
 ################################################################################
 
 def train_one_model(model,
@@ -882,7 +722,8 @@ def train_one_model(model,
                     monosemantic_info=None,
                     prompt="Once upon a",
                     grad_clip=1.0,
-                    weight_decay=0.01):
+                    weight_decay=0.01,
+                    val_loader=None):
     """
     Train a single model (LSTM, Transformer, or K-gram MLP) on the provided data.
     
@@ -901,14 +742,23 @@ def train_one_model(model,
         prompt: Text prompt for generation during training
         grad_clip: Gradient clipping norm to prevent exploding gradients
         weight_decay: L2 regularization strength (AdamW)
+        val_loader: Optional validation DataLoader
+    
+    Returns:
+        (train_loss_history, val_loss_history): Tuples of (global_step, loss) for plotting
     """
     # Use AdamW optimizer with weight decay for better generalization
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
 
     # Track timing for periodic text generation
     start_time = time.time()
     next_sample_time = start_time
     global_step = 0  # Total steps across all epochs
+    
+    # Track loss history for plotting
+    train_loss_history = []
+    val_loss_history = []
 
     for epoch in range(1, epochs + 1):
         model.train()  # Set model to training mode (enables dropout, etc.)
@@ -936,11 +786,8 @@ def train_one_model(model,
             loss.backward()
             
             # Clip gradients to prevent exploding gradients (common in RNNs/Transformers)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             
-            # Update model parameters
-            optimizer.step()
-
             # Update model parameters
             optimizer.step()
 
@@ -948,6 +795,9 @@ def train_one_model(model,
             total_loss += loss.item()
             partial_loss += loss.item()
             partial_count += 1
+            
+            # Record loss for plotting
+            train_loss_history.append((global_step, loss.item()))
 
             # Log training progress at regular intervals
             if batch_idx % log_steps == 0:
@@ -1006,11 +856,37 @@ def train_one_model(model,
 
         # Print epoch summary
         avg_loss = total_loss / step_in_epoch
-        print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
+        print(f"[{model_name}] *** End of Epoch {epoch} *** Train Avg Loss: {avg_loss:.4f}")
+        
+        # Evaluate on validation set if provided
+        if val_loader is not None:
+            model.eval()
+            val_loss_total = 0.0
+            val_steps = 0
+            
+            print(f"[{model_name}] Evaluating on validation set...")
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    val_batch = val_batch.to(device)
+                    val_logits = model(val_batch)
+                    val_loss = compute_next_token_loss(val_logits, val_batch)
+                    val_loss_total += val_loss.item()
+                    val_steps += 1
+            
+            avg_val_loss = val_loss_total / val_steps if val_steps > 0 else 0.0
+            print(f"[{model_name}] *** Validation Loss: {avg_val_loss:.4f} ***")
+            
+            # Record validation loss (use global_step as x-coordinate)
+            val_loss_history.append((global_step, avg_val_loss))
+            
+            model.train()  # Back to training mode
 
         # Save model checkpoint after each epoch (allows resuming training)
-        torch.save(model.state_dict(), f"{model_name}_epoch{epoch}.pt")
-        print(f"Saved {model_name} weights to {model_name}_epoch{epoch}.pt")
+        torch.save(model.state_dict(), f"/scratch/ml_fall25/{model_name}_epoch{epoch}.pt")
+        print(f"Saved {model_name} weights to /scratch/ml_fall25/{model_name}_epoch{epoch}.pt")
+    
+    # Return loss histories for plotting
+    return train_loss_history, val_loss_history
 
 
 ################################################################################
@@ -1019,12 +895,6 @@ def train_one_model(model,
 
 def main():
     args = parse_args()
-
-    # Set random seeds for reproducibility across runs
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
 
     # Extract hyperparameters from command-line arguments
     k = args.kgram_k  # Window size for k-gram model
@@ -1036,9 +906,9 @@ def main():
     learning_rate = args.learning_rate  # Optimizer step size
 
     block_size = args.block_size  # Maximum sequence length
-    train_subset_size = args.train_subset_size  # How many TinyStories examples to use
+    train_subset_size = 20000
     log_interval_steps = 100  # Print loss every N steps
-    sample_interval_seconds = args.sample_interval  # Generate text every N seconds
+    sample_interval_seconds = 30 # Generate text every N seconds
 
     max_steps_per_epoch = args.max_steps_per_epoch  # Optional cap on training steps
     num_inner_layers = args.num_inner_mlp_layers  # Depth of k-gram MLP
@@ -1063,7 +933,8 @@ def main():
     if args.tinystories_weight > 0.0:
         print(f"Loading TinyStories from huggingface with weight={args.tinystories_weight}...")
         # Use slice notation to load only first N examples (faster than .select())
-        dataset = load_dataset("roneneldan/TinyStories", split=f"train[:{train_subset_size}]")
+        dataset = load_dataset("roneneldan/TinyStories", split=f"train")
+        dataset = dataset.select(range(train_subset_size)) # type: ignore
     else:
         print("TinyStories weight=0 => skipping TinyStories.")
         dataset = None
@@ -1105,19 +976,53 @@ def main():
     p_tiny = args.tinystories_weight  # Probability of sampling TinyStories
     if len(tinystories_seqs) == 0 and p_tiny>0:
         print("Warning: TinyStories is empty but tinystories_weight>0. That's okay, no data from it.")
-    combined_dataset = MixedSequenceDataset(
-        tinystories_seqs=tinystories_seqs,
-        other_seqs=other_seqs,
-        p_tiny=p_tiny
+    
+    # Combine all sequences for splitting
+    all_sequences = tinystories_seqs + other_seqs
+    total_seqs = len(all_sequences)
+    
+    # Split into train and validation
+    val_split = args.val_split
+    val_size = int(total_seqs * val_split)
+    train_size = total_seqs - val_size
+    
+    print(f"\n📊 Dataset split: {train_size} train, {val_size} validation ({val_split*100:.1f}%)")
+    
+    # Shuffle and split
+    import random as py_random
+    py_random.shuffle(all_sequences)
+    train_seqs = all_sequences[:train_size]
+    val_seqs = all_sequences[train_size:]
+    
+    # Create datasets
+    # For training, we still want mixed sampling behavior
+    train_dataset = MixedSequenceDataset(
+        tinystories_seqs=train_seqs if len(tinystories_seqs) > 0 else [],
+        other_seqs=[] if len(tinystories_seqs) > 0 else train_seqs,
+        p_tiny=1.0 if len(tinystories_seqs) > 0 else 0.0
+    )
+    
+    val_dataset = MixedSequenceDataset(
+        tinystories_seqs=val_seqs if len(tinystories_seqs) > 0 else [],
+        other_seqs=[] if len(tinystories_seqs) > 0 else val_seqs,
+        p_tiny=1.0 if len(tinystories_seqs) > 0 else 0.0
     )
 
-    # Create DataLoader for batching and shuffling
+    # Create DataLoaders
     train_loader = torch.utils.data.DataLoader(
-        combined_dataset,
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,  # Shuffle for better training
         num_workers=0,  # Single-threaded (multi-process can cause issues on some systems)
         collate_fn=seq_collate_fn  # Custom collation for variable-length sequences
+    )
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,  # No shuffle for validation
+        num_workers=0,
+        collate_fn=seq_collate_fn
     )
 
     ############################################################################
@@ -1158,9 +1063,11 @@ def main():
     ############################################################################
     # Train each model
     ############################################################################
+    all_loss_histories = {}  # Store loss histories for all models
+    
     for model_name, model in models.items():
         print(f"\n=== Training model: {model_name} ===")
-        train_one_model(
+        train_history, val_history = train_one_model(
             model=model,
             loader=train_loader,
             epochs=num_epochs,
@@ -1171,8 +1078,15 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
-            prompt=args.prompt  # <--- Pass the user-specified prompt here
+            prompt=args.prompt,  # user-specified prompt here
+            val_loader=val_loader  # Pass validation loader
         )
+        
+        # Store loss histories (both train and val)
+        all_loss_histories[model_name] = {
+            'train': train_history,
+            'val': val_history
+        }
 
         # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():
@@ -1205,6 +1119,13 @@ def main():
         print(f"Annotated:\n{ann_topp1}")
         print("--------------------------------------------------")
 
+    # Save loss histories for plotting
+    import pickle
+    with open("loss_histories.pkl", "wb") as f:
+        pickle.dump(all_loss_histories, f)
+    print("\n✅ Saved loss histories to loss_histories.pkl")
+    print("Run 'python plot_losses.py' to visualize training curves!")
+    
     # Finally, let's share how I'm feeling:
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
 
