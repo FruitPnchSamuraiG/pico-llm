@@ -72,8 +72,6 @@ python pico-llm.py \
     --transformer_blocks 3 \
     --ff_mult 2 \
     --learning_rate 3e-4 \
-    --grad_clip 1.0 \
-    --weight_decay 0.01 \
     --prompt "Once upon a time" \
     $MAX_STEPS
 
