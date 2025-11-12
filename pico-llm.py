@@ -361,7 +361,7 @@ class Block(nn.Module):
         return x
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4):
+    def __init__(self, vocab_size=50257, d_model=1024, n_heads=4, n_blocks=3):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -908,7 +908,8 @@ def main():
     plt.grid(True)
     plt.ylim(bottom=0)
 
-    save_path_loss = "model_loss_comparison_1.png"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    save_path_loss = f"model_loss_comparison_{timestamp}.png"
     plt.savefig(save_path_loss)
     print(f"Saved loss comparison plot to {save_path_loss}")
 
@@ -947,7 +948,7 @@ def main():
     plt.grid(True)
     plt.ylim(0, 1.0) # Accuracy is between 0 and 1
 
-    save_path_acc = "model_accuracy_comparison_1.png"
+    save_path_acc = f"model_accuracy_comparison_{timestamp}.png"
     plt.savefig(save_path_acc)
     print(f"Saved accuracy comparison plot to {save_path_acc}")
 
