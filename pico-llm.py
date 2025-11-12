@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from torch.utils.data import random_split
 
 # We do not import numpy or scikit-learn, so we implement a naive k-means in pure PyTorch.
 # If you prefer scikit-learn, you can adapt the code.
@@ -22,19 +24,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train multiple k-gram or sequence-based models on TinyStories and/or custom text files.")
     parser.add_argument("--input_files", nargs="*", default=None,
                         help="Optional list of text files to mix in as data sources. Each line is one example (up to block_size).")
-    parser.add_argument("--tinystories_weight", type=float, default=0.5,
-                        help="Probability of sampling from TinyStories if present. Default=0.5. (set to 0.0 to skip TinyStories).")
+    parser.add_argument("--tinystories_weight", type=float, default=0.8,
+                        help="Probability of sampling from TinyStories if present. Default=0.8. (set to 0.0 to skip TinyStories).")
     parser.add_argument("--max_steps_per_epoch", type=int, default=None,
                         help="If set, each epoch ends after this many steps (for quick tests).")
-    parser.add_argument("--num_inner_mlp_layers", type=int, default=1,
-                        help="Number of (Linear->SiLU) blocks inside the k-gram MLP. Default=1.")
+    parser.add_argument("--num_inner_mlp_layers", type=int, default=2,
+                        help="Number of (Linear->SiLU) blocks inside the k-gram MLP. Default=2.")
     parser.add_argument("--monosemantic_enabled", action="store_true",
                         help="(DISABLED BY DEFAULT) If set, run the monosemantic analysis.")
     parser.set_defaults(monosemantic_enabled=False)  # disable by default
 
     # Additional hyperparams to mitigate slow k-gram
-    parser.add_argument("--kgram_k", type=int, default=3,
-                        help="Sliding window size for k-gram MLP. Smaller can reduce memory usage. Default=3.")
+    parser.add_argument("--kgram_k", type=int, default=4,
+                        help="Sliding window size for k-gram MLP. Smaller can reduce memory usage. Default=4.")
     parser.add_argument("--kgram_chunk_size", type=int, default=1,
                         help="Process k-gram timesteps in micro-batches. Default=1.")
 
@@ -121,6 +123,41 @@ def seq_collate_fn(batch):
 
     return padded
 
+def compute_accuracy(logits, targets):
+    """
+    Computes top-1 accuracy for next-token prediction, ignoring padding (target=0).
+
+    logits: (seq_len, batch, vocab_size)
+    targets: (seq_len, batch)
+    
+    We shift to align with next-token prediction:
+    - logits[:-1] predicts targets[1:]
+    """
+    seq_len, batch_size, vocab_size = logits.shape
+    if seq_len < 2:
+        return 0.0  # Need at least 2 positions for next-token prediction
+    
+    # 1. Shift for next-token prediction (same as in compute_next_token_loss)
+    preds_logits = logits[:-1, :, :]  # (seq_len-1, batch, vocab_size)
+    gold = targets[1:, :]              # (seq_len-1, batch)
+    
+    # 2. Get the model's top prediction (token ID) for each position
+    predictions = torch.argmax(preds_logits, dim=-1)  # (seq_len-1, batch)
+
+    # 3. Create a mask to ignore padding tokens (where target ID is 0)
+    mask = (gold != 0)
+
+    # 4. Compare predictions to targets, only where not padding
+    correct = (predictions == gold) & mask
+
+    # 5. Calculate the mean accuracy
+    total_non_padded = mask.sum()
+    if total_non_padded == 0:
+        return 0.0  # Avoid division by zero
+
+    accuracy = correct.sum().float() / total_non_padded
+    return accuracy.item()
+
 
 ################################################################################
 # 3. K-gram MLP in a sequence-to-sequence approach
@@ -165,8 +202,8 @@ class KGramMLPSeqModel(nn.Module):
 
         # Initialize the layers of the MLP
         layers = []
-        # Input dimension is k * vocab_size (one-hot for k tokens)
-        input_dim = self.k * self.vocab_size
+        # Input dimension is k * embed_size (embeddings for k tokens)
+        input_dim = self.k * self.embed_size
 
         # Add the (Linear -> SiLU) inner blocks
         # num_inner_layers=1 means: 1 (Linear->SiLU) block + 1 output Linear
@@ -195,7 +232,7 @@ class KGramMLPSeqModel(nn.Module):
         tokens = tokens_seq.transpose(0, 1)  # (batch, seq_len)
 
         # Add padding of zeros at the beginning for positions < k
-        padded_tokens = F.pad(tokens, (self.k - 1, "constant", 0), value=0)  # (batch, seq_len + k - 1)
+        padded_tokens = F.pad(tokens, (self.k - 1, 0), value=0)  # (batch, seq_len + k - 1)
 
         # Create a sliding window view of size k
         unfolded_tokens = padded_tokens.unfold(dimension=1, size=self.k, step=1)  # (batch, seq_len, k)
@@ -483,6 +520,7 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
 
 def train_one_model(model,
                     loader,
+                    val_loader,
                     epochs,
                     model_name,
                     device,
@@ -495,8 +533,14 @@ def train_one_model(model,
                     prompt="Once upon a"):
     """
     We add `prompt` as an explicit argument so we can pass it down from main().
+    We also add `val_loader` for validation loss computation.
     """
     optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    train_losses = []
+    train_accuracies = []
+    val_losses = []
+    val_accuracies = []
 
     start_time = time.time()
     next_sample_time = start_time
@@ -517,6 +561,7 @@ def train_one_model(model,
 
             logits = model(batch_tokens)  # (seq_len, batch, vocab_size)
             loss = compute_next_token_loss(logits, batch_tokens)
+            acc = compute_accuracy(logits, batch_tokens)
 
             optimizer.zero_grad()
             loss.backward()
@@ -525,12 +570,15 @@ def train_one_model(model,
             total_loss += loss.item()
             partial_loss += loss.item()
             partial_count += 1
+            train_losses.append(loss.item())
+            train_accuracies.append(acc)
 
             if batch_idx % log_steps == 0:
                 avg_part_loss = partial_loss / partial_count
                 print(f"[{model_name}] Epoch {epoch}/{epochs}, "
                       f"Step {batch_idx}/{len(loader)} (global step: {global_step}) "
-                      f"Partial Avg Loss: {avg_part_loss:.4f}")
+                      f"Partial Avg Loss: {avg_part_loss:.4f} "
+                      f"Acc: {acc*100:.2f}%")
                 partial_loss = 0.0
                 partial_count = 0
 
@@ -575,7 +623,37 @@ def train_one_model(model,
                 break
 
         avg_loss = total_loss / step_in_epoch
-        print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
+        
+        # Validation at end of epoch
+        model.eval()
+        val_total_loss = 0.0
+        val_total_acc = 0.0
+        val_batch_count = 0
+        with torch.no_grad():
+            for val_batch_tokens in val_loader:
+                val_batch_tokens = val_batch_tokens.to(device)
+                val_logits = model(val_batch_tokens)
+                val_loss = compute_next_token_loss(val_logits, val_batch_tokens)
+                val_acc = compute_accuracy(val_logits, val_batch_tokens)
+                val_total_loss += val_loss.item()
+                val_total_acc += val_acc
+                val_batch_count += 1
+        
+        if val_batch_count > 0:
+            avg_val_loss = val_total_loss / val_batch_count
+            avg_val_acc = val_total_acc / val_batch_count
+        else:
+            avg_val_loss = 0.0
+            avg_val_acc = 0.0
+        
+        val_losses.append((global_step, avg_val_loss))
+        val_accuracies.append((global_step, avg_val_acc))
+        
+        model.train()
+        
+        print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Train Loss: {avg_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, Val Acc: {avg_val_acc*100:.2f}%")
+
+    return train_losses, train_accuracies, val_losses, val_accuracies
 
 
 ################################################################################
@@ -665,10 +743,25 @@ def main():
         p_tiny=p_tiny
     )
 
+    # Split dataset into train and validation (90/10 split)
+    total_size = len(combined_dataset)
+    train_size = int(0.9 * total_size)
+    val_size = total_size - train_size
+    train_dataset, val_dataset = random_split(combined_dataset, [train_size, val_size])
+    print(f"Dataset split: {train_size} training samples, {val_size} validation samples")
+
     train_loader = torch.utils.data.DataLoader(
-        combined_dataset,
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=0,
+        collate_fn=seq_collate_fn
+    )
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
         num_workers=0,
         collate_fn=seq_collate_fn
     )
@@ -694,20 +787,24 @@ def main():
     ).to(device)
 
     models = {
-      # "kgram_mlp_seq": kgram_model,
+        "kgram_mlp_seq": kgram_model,
         "lstm_seq": lstm_model,
-      # "kvcache_transformer": kv_transformer,
+        "kvcache_transformer": transformer,
     }
 
-
+    all_model_train_losses = {}
+    all_model_train_accuracies = {}
+    all_model_val_losses = {}
+    all_model_val_accuracies = {}
     ############################################################################
     # Train each model
     ############################################################################
     for model_name, model in models.items():
         print(f"\n=== Training model: {model_name} ===")
-        train_one_model(
+        train_losses, train_accs, val_losses, val_accs = train_one_model(
             model=model,
             loader=train_loader,
+            val_loader=val_loader,
             epochs=num_epochs,
             model_name=model_name,
             device=device,
@@ -718,6 +815,29 @@ def main():
             enc=enc,
             prompt=args.prompt  # <--- Pass the user-specified prompt here
         )
+        all_model_train_losses[model_name] = train_losses
+        all_model_train_accuracies[model_name] = train_accs
+        all_model_val_losses[model_name] = val_losses
+        all_model_val_accuracies[model_name] = val_accs
+
+        # Save the trained model
+        checkpoint_path = f"{model_name}_checkpoint.pt"
+        checkpoint = {
+            'model_state_dict': model.state_dict(),
+            'model_name': model_name,
+            'vocab_size': vocab_size,
+            'embed_size': embed_size,
+            'model_config': {
+                'kgram_k': k if model_name == 'kgram_mlp_seq' else None,
+                'num_inner_layers': num_inner_layers if model_name == 'kgram_mlp_seq' else None,
+                'hidden_size': embed_size if model_name == 'lstm_seq' else None,
+            },
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'val_accuracies': val_accs,
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"[{model_name}] Saved checkpoint to {checkpoint_path}")
 
         # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():
@@ -752,6 +872,86 @@ def main():
 
     # Finally, let's share how I'm feeling:
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
+    # --- PLOT 1: LOSS ---
+    plt.figure(figsize=(12, 6))
+    for model_name in models.keys():
+        # Plot smoothed training loss
+        train_losses = all_model_train_losses[model_name]
+        if len(train_losses) > 100:
+            window = 50
+            # Use 'replicate' padding mode to avoid edge artifacts from zero-padding
+            losses_tensor = torch.tensor(train_losses).view(1, 1, -1)
+            # Manually replicate edges to avoid the zero-padding artifact
+            pad_size = window // 2
+            padded = F.pad(losses_tensor, (pad_size, pad_size), mode='replicate')
+            smooth_losses = torch.nn.functional.conv1d(
+                padded,
+                torch.ones(1, 1, window) / window,
+                padding=0  # No padding since we manually padded
+            ).view(-1).tolist()
+            x = list(range(1, len(smooth_losses) + 1))
+            plt.plot(x, smooth_losses, label=f"{model_name} Train Loss (smoothed)", alpha=0.7, linestyle='--')
+        else:
+            x = list(range(1, len(train_losses) + 1))
+            plt.plot(x, train_losses, label=f"{model_name} Train Loss", alpha=0.7, linestyle='--')
+
+        # Plot validation loss (stepped)
+        val_losses = all_model_val_losses[model_name]
+        if val_losses:
+            steps, losses = zip(*val_losses)
+            plt.plot(steps, losses, label=f"{model_name} Val Loss", marker='o', markersize=4)
+
+    plt.title("Model Training & Validation Loss")
+    plt.xlabel("Training Step")
+    plt.ylabel("Loss (Cross-Entropy)")
+    plt.legend()
+    plt.grid(True)
+    plt.ylim(bottom=0)
+
+    save_path_loss = "model_loss_comparison_1.png"
+    plt.savefig(save_path_loss)
+    print(f"Saved loss comparison plot to {save_path_loss}")
+
+    # --- PLOT 2: ACCURACY ---
+    plt.figure(figsize=(12, 6))
+    for model_name in models.keys():
+        # Plot smoothed training accuracy
+        train_accs = all_model_train_accuracies[model_name]
+        if len(train_accs) > 100:
+            window = 50
+            # Use 'replicate' padding mode to avoid edge artifacts from zero-padding
+            accs_tensor = torch.tensor(train_accs).view(1, 1, -1)
+            pad_size = window // 2
+            padded = F.pad(accs_tensor, (pad_size, pad_size), mode='replicate')
+            smooth_accs = torch.nn.functional.conv1d(
+                padded,
+                torch.ones(1, 1, window) / window,
+                padding=0  # No padding since we manually padded
+            ).view(-1).tolist()
+            x = list(range(1, len(smooth_accs) + 1))
+            plt.plot(x, smooth_accs, label=f"{model_name} Train Acc (smoothed)", alpha=0.7, linestyle='--')
+        else:
+            x = list(range(1, len(train_accs) + 1))
+            plt.plot(x, train_accs, label=f"{model_name} Train Acc", alpha=0.7, linestyle='--')
+
+        # Plot validation accuracy (stepped)
+        val_accs = all_model_val_accuracies[model_name]
+        if val_accs:
+            steps, accs = zip(*val_accs)
+            plt.plot(steps, accs, label=f"{model_name} Val Acc", marker='o', markersize=4)
+
+    plt.title("Model Training & Validation Accuracy")
+    plt.xlabel("Training Step")
+    plt.ylabel("Accuracy (Top-1)")
+    plt.legend()
+    plt.grid(True)
+    plt.ylim(0, 1.0) # Accuracy is between 0 and 1
+
+    save_path_acc = "model_accuracy_comparison_1.png"
+    plt.savefig(save_path_acc)
+    print(f"Saved accuracy comparison plot to {save_path_acc}")
+
+    # plt.show()
 
 
 if __name__ == "__main__":
