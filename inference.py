@@ -67,13 +67,6 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Device to use (default: cuda:0)")
     
-    # Checkpoint directory for --compare mode
-    parser.add_argument("--checkpoint_dir", type=str, 
-                        default="/scratch/kk6081/ml_fall25/checkpoints",
-                        help="Directory containing checkpoint files")
-    parser.add_argument("--epoch", type=int, default=3,
-                        help="Which epoch checkpoint to use (default: 3)")
-    
     return parser.parse_args()
 
 
