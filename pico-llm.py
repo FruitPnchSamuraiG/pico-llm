@@ -470,6 +470,7 @@ def train_one_model(model,
             optimizer.step()
 
             total_loss += loss.item()
+            train_loss_history.append((global_step, loss.item()))
             partial_loss += loss.item()
             partial_count += 1
 
@@ -521,33 +522,24 @@ def train_one_model(model,
                 print(f"[{model_name}] Reached max_steps_per_epoch={max_steps_per_epoch}, ending epoch {epoch} early.")
                 break
 
-        avg_loss = total_loss / step_in_epoch
-        print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
-
-        train_loss_history.append(avg_loss)
 
         # Simple validation (using a small fixed subset of the training data)
         if loader.dataset is not None:
             model.eval()
-            val_loss = 0.0
-            val_batches = 0
             with torch.no_grad():
                 for i, val_batch in enumerate(loader):
-                    if i >= 10:  # limit validation to 10 batches for speed
+                    if i >= 10:  # limit validation to 10 batches
                         break
-                    val_batch = val_batch.to(device)
-                    logits = model(val_batch)
-                    loss = compute_next_token_loss(logits, val_batch)
-                    val_loss += loss.item()
-                    val_batches += 1
-            val_loss /= val_batches
-            val_loss_history.append(val_loss)
-            print(f"[{model_name}] Validation Loss (approx): {val_loss:.4f}")
+                val_batch = val_batch.to(device)
+                logits = model(val_batch)
+                loss = compute_next_token_loss(logits, val_batch)
+                val_loss_history.append((global_step, loss.item()))
+
+            print(f"[{model_name}] Validation collected {len(val_loss_history)} points so far.")
+
 
     return train_loss_history, val_loss_history
-
-
-################################################################################
+###############################################################################
 # 9. Main
 ################################################################################
 
@@ -663,7 +655,7 @@ def main():
     ).to(device)
 
     models = {
-        "kgram_mlp_seq": kgram_model,
+       # "kgram_mlp_seq": kgram_model,
         "lstm_seq": lstm_model,
         "kvcache_transformer": transformer,
     }
@@ -688,7 +680,10 @@ def main():
             enc=enc,
             prompt=args.prompt  # <--- Pass the user-specified prompt here
         )
-        results[model_name] = (train_loss, val_loss)
+        results[model_name] = {
+            "train": train_loss,
+             "val": val_loss
+        }
         
         # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():
@@ -726,11 +721,17 @@ def main():
 
     def plot_loss_curves(results, save_path="loss_curves.png"):
         plt.figure(figsize=(8,6))
-        for model_name, (train_loss, val_loss) in results.items():
+
+        for model_name, model_results in results.items():
+            train_loss = model_results["train"]
+            val_loss = model_results["val"]
+
             plt.plot(train_loss, label=f"{model_name} Train")
+
             if val_loss:
                 plt.plot(val_loss, '--', label=f"{model_name} Val")
-        plt.xlabel("Epoch")
+
+        plt.xlabel("Step")
         plt.ylabel("Loss")
         plt.title("Training and Validation Loss")
         plt.legend()
@@ -741,9 +742,5 @@ def main():
         print(f"Saved loss curves to {save_path}")
 
     plot_loss_curves(results, save_path="loss_curves.png")
-
-    print("\n*** Training complete. Loss curves saved. ***")
-
-
 if __name__ == "__main__":
     main()
