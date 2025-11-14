@@ -53,6 +53,32 @@ def parse_args():
     parser.add_argument("--device_id", type=str, default="cuda:0",
                         help="Torch device identifier (default='cuda:0'). If CUDA is unavailable, fallback to 'cpu'.")
 
+    # Training/runtime hyperparameters (previously hard-coded)
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Training batch size. Default=16.")
+    parser.add_argument("--num_epochs", type=int, default=3,
+                        help="Number of training epochs. Default=3.")
+    parser.add_argument("--learning_rate", type=float, default=1e-3,
+                        help="Optimizer learning rate. Default=1e-3.")
+    parser.add_argument("--train_subset_size", type=int, default=20000,
+                        help="Number of TinyStories samples to load when enabled. Default=20000.")
+    parser.add_argument("--log_interval_steps", type=int, default=100,
+                        help="How often (in steps) to log partial loss. Default=100.")
+    parser.add_argument("--sample_interval_seconds", type=int, default=30,
+                        help="Interval in seconds to print sample generations during training. Default=30.")
+
+    # Model-specific hyperparameters
+    parser.add_argument("--lstm_hidden_size", type=int, default=None,
+                        help="Hidden size for LSTM. Default=None meaning same as embed_size.")
+    parser.add_argument("--transformer_heads", type=int, default=4,
+                        help="Number of attention heads in Transformer. Default=4.")
+    parser.add_argument("--transformer_blocks", type=int, default=3,
+                        help="Number of Transformer blocks. Default=3.")
+
+    # Optional run tag to append to artifact names
+    parser.add_argument("--run_tag", type=str, default="",
+                        help="Optional short label to append to saved artifact filenames.")
+
     args = parser.parse_args()
     return args
 
@@ -324,25 +350,35 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         # Calculate the Root Mean Square of the input
         # x.pow(2).mean(-1, keepdim=True) is the Mean Square
-        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         # Normalize x and apply scale
-        return (x / rms) * self.scale
+        return (x * norm) * self.scale
 
 class Block(nn.Module):
     """ A single Transformer block, as described in the blueprint. """
     def __init__(self, d_model, n_heads):
         super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads  # Each head processes head_dim features
         # Causal Self-Attention
         self.norm1 = RMSNorm(d_model)
-        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=False)
+        # Multi-head attention projections
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)  # Query projection
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)  # Key projection
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)  # Value projection
+        self.out_proj = nn.Linear(d_model, d_model)  # Output projection
+
+        # Feedforward network (MLP)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),  # Expand to 4x dimension
+            nn.SiLU(),  # Smooth nonlinearity (used in modern LLMs)
+            nn.Linear(4 * d_model, d_model)  # Project back to d_model
+        )
 
         # Feed-Forward Netowrk (MLP)
         self.norm2 = RMSNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model), # Standard to expand 4x
-            nn.SiLU(), # Common activation function
-            nn.Linear(4 * d_model, d_model),
-        )
+
 
     def forward(self, x, causal_mask):
         """
@@ -350,26 +386,51 @@ class Block(nn.Module):
         causal_mask: (seq_len, seq_len)
         return: (seq_len, batch, d_model)
         """
+        b, t, d = x.size()
         # Attention with skip connection
         norm_x = self.norm1(x)
-        # Note: self.attn(Q, K, V). We get Q, K, V from the *normalized* x.
-        attn_output, _ = self.attn(norm_x, norm_x, norm_x, attn_mask=causal_mask, need_weights=False)
-        x = x + attn_output
 
-        # MLP with skip connection
-        x = x + self.mlp(self.norm2(x))
+        # Project to Q, K, V and reshape for multi-head attention
+        # Shape: (batch, seq_len, d_model) -> (batch, n_heads, seq_len, head_dim)
+        q = self.q_proj(norm_x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(norm_x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(norm_x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+        # Scaled dot-product attention: Q @ K^T / sqrt(d_k)
+        # Shape: (batch, n_heads, seq_len, seq_len)
+        attn_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Apply causal mask: prevent position i from attending to position j > i
+        if causal_mask is not None:
+            # Slice mask to current sequence length (mask is pre-allocated for max_len)
+            attn_scores = attn_scores.masked_fill(causal_mask[:, None, :t, :t] == 0, -1e9)
+            # Softmax to get attention probabilities
+        attn_probs = F.softmax(attn_scores, dim=-1)  # (batch, heads, seq_len, seq_len)
+
+        # Apply attention to values
+        attn_out = attn_probs @ v  # (batch, heads, seq_len, head_dim)
+
+        # Concatenate heads and project
+        attn_out = attn_out.transpose(1, 2).contiguous().view(b, t, d)
+        x = x + self.out_proj(attn_out)  # Residual connection
+
+        # ===== FEEDFORWARD BLOCK =====
+        xf = self.norm2(x)  # Pre-norm: normalize BEFORE feedforward
+        x = x + self.ff(xf)   # Feedforward with residual
         return x
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=4, n_blocks=3):
+    def __init__(self, vocab_size=50257, d_model=1024, n_heads=4, n_blocks=3, max_seq_len=1024):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_blocks = n_blocks
+        self.max_seq_len = max_seq_len
 
         # Token embedding layer
         self.token_embedding = nn.Embedding(vocab_size, d_model)
+        # Positional embedding layer (index by position 0..max_seq_len-1)
+        self.pos_emb = nn.Embedding(max_seq_len, d_model)
 
         # Stack of transformer blocks
         self.blocks = nn.ModuleList([
@@ -380,13 +441,11 @@ class TransformerModel(nn.Module):
         self.final_norm = RMSNorm(d_model)
 
         # Unembedding layer to produce logits
-        self.lm_head = nn.Linear(d_model, vocab_size)
-
-    def _create_causal_mask(self, seq_len, device):
-        # Create causal mask to prevent attention to future tokens
-        # This is the "causal" part of a "causal decoder-only transformer"
-        causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=device) * float('-inf'), diagonal=1)
-        return causal_mask
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        # Create boolean causal mask: True means "mask out" (disallow attention)
+        # Upper-triangular (k=1) are future positions that should be masked.
+        causal_mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.uint8))
+        self.register_buffer("causal_mask", causal_mask.unsqueeze(0))
 
     def forward(self, tokens_seq):
         """
@@ -395,21 +454,26 @@ class TransformerModel(nn.Module):
         """
         seq_len, batch_size = tokens_seq.shape
         device = tokens_seq.device
+        # Convert to (batch, seq_len) for attention computation
+        tokens_b = tokens_seq.transpose(0, 1)
 
         # Get token embeddings
-        x = self.token_embedding(tokens_seq)  # (seq_len, batch, d_model)
+        # Keep shape as (seq_len, batch, d_model) to match MultiheadAttention with batch_first=False
+        x = self.token_embedding(tokens_b)  # (seq_len, batch, d_model)
 
-        # Create causal mask
-        causal_mask = self._create_causal_mask(seq_len, device)
+        # Add positional embeddings
+        # positions: (seq_len,) => pos_emb: (seq_len, d_model) => expand to (seq_len, batch, d_model)
+        # positions = torch.arange(seq_len, device=device).unsqueeze(0) # (1, seq_len)
+        # x = x + self.pos_emb(positions)  # (seq_len, batch, d_model)
 
         # Pass through transformer blocks
         for block in self.blocks:
-            x = block(x, causal_mask)
+            x = block(x, causal_mask=self.causal_mask)
 
         # Final normalization and LM head to get logits
         x = self.final_norm(x)                 # (seq_len, batch, d_model)
         logits = self.lm_head(x)               # (seq_len, batch, vocab_size)
-        return logits
+        return logits.transpose(0, 1)  # (seq_len, batch, vocab_size)
 
 ################################################################################
 # 6. K-Means Monosemantic (DISABLED by default)
@@ -662,20 +726,22 @@ def train_one_model(model,
 
 def main():
     args = parse_args()
+    # Track total execution time of the run for inclusion in artifact names
+    overall_start_time = time.time()
 
     # Additional local variables from arguments
     k = args.kgram_k
     chunk_size = args.kgram_chunk_size
 
     embed_size = args.embed_size
-    batch_size = 16
-    num_epochs = 3
-    learning_rate = 1e-3
+    batch_size = args.batch_size
+    num_epochs = args.num_epochs
+    learning_rate = args.learning_rate
 
     block_size = args.block_size
-    train_subset_size = 20000
-    log_interval_steps = 100
-    sample_interval_seconds = 30
+    train_subset_size = args.train_subset_size
+    log_interval_steps = args.log_interval_steps
+    sample_interval_seconds = args.sample_interval_seconds
 
     max_steps_per_epoch = args.max_steps_per_epoch
     num_inner_layers = args.num_inner_mlp_layers
@@ -777,13 +843,19 @@ def main():
         chunk_size=chunk_size
     ).to(device)
 
+    lstm_hidden = embed_size if args.lstm_hidden_size is None else args.lstm_hidden_size
     lstm_model = LSTMSeqModel(
         vocab_size=vocab_size,
         embed_size=embed_size,
-        hidden_size=embed_size
+        hidden_size=lstm_hidden
     ).to(device)
 
     transformer = TransformerModel(
+        vocab_size=vocab_size,
+        d_model=embed_size,
+        n_heads=args.transformer_heads,
+        n_blocks=args.transformer_blocks,
+        max_seq_len=block_size,
     ).to(device)
 
     models = {
@@ -830,7 +902,9 @@ def main():
             'model_config': {
                 'kgram_k': k if model_name == 'kgram_mlp_seq' else None,
                 'num_inner_layers': num_inner_layers if model_name == 'kgram_mlp_seq' else None,
-                'hidden_size': embed_size if model_name == 'lstm_seq' else None,
+                'hidden_size': lstm_hidden if model_name == 'lstm_seq' else None,
+                'transformer_heads': args.transformer_heads if model_name == 'kvcache_transformer' else None,
+                'transformer_blocks': args.transformer_blocks if model_name == 'kvcache_transformer' else None,
             },
             'train_losses': train_losses,
             'val_losses': val_losses,
@@ -909,7 +983,21 @@ def main():
     plt.ylim(bottom=0)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    save_path_loss = f"model_loss_comparison_{timestamp}.png"
+    safe_device = str(device).replace(":", "-")
+    # Compute elapsed runtime
+    elapsed_seconds = int(time.time() - overall_start_time)
+    h, rem = divmod(elapsed_seconds, 3600)
+    m, s = divmod(rem, 60)
+    time_tag = f"{h:02d}h{m:02d}m{s:02d}s"
+    tag_suffix = f"_tag{args.run_tag}" if args.run_tag else ""
+    config_tag = (
+        f"bs{batch_size}_ep{num_epochs}_lr{learning_rate}_"
+        f"blk{block_size}_emb{embed_size}_k{k}_layers{num_inner_layers}_"
+        f"chunk{chunk_size}_tiny{args.tinystories_weight}_subset{train_subset_size}_"
+        f"lstmH{lstm_hidden}_heads{args.transformer_heads}_blocks{args.transformer_blocks}_"
+        f"dev{safe_device}_t{time_tag}{tag_suffix}"
+    )
+    save_path_loss = f"model_loss_comparison_{config_tag}_{timestamp}.png"
     plt.savefig(save_path_loss)
     print(f"Saved loss comparison plot to {save_path_loss}")
 
@@ -948,7 +1036,7 @@ def main():
     plt.grid(True)
     plt.ylim(0, 1.0) # Accuracy is between 0 and 1
 
-    save_path_acc = f"model_accuracy_comparison_{timestamp}.png"
+    save_path_acc = f"model_accuracy_comparison_{config_tag}_{timestamp}.png"
     plt.savefig(save_path_acc)
     print(f"Saved accuracy comparison plot to {save_path_acc}")
 
