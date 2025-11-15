@@ -744,8 +744,7 @@ def train_one_model(model,
     Returns:
         (train_loss_history, val_loss_history): Tuples of (global_step, loss) for plotting
     """
-    # Use AdamW optimizer with weight decay for better generalization
-    # optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Use AdamW optimizer
     optimizer = optim.AdamW(model.parameters(), lr=lr)
 
     # Track timing for periodic text generation
@@ -781,9 +780,6 @@ def train_one_model(model,
             # Backward pass: compute gradients
             optimizer.zero_grad()
             loss.backward()
-            
-            # Clip gradients to prevent exploding gradients (common in RNNs/Transformers)
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             
             # Update model parameters
             optimizer.step()
@@ -879,8 +875,9 @@ def train_one_model(model,
             model.train()  # Back to training mode
 
         # Save model checkpoint after each epoch (allows resuming training)
-        torch.save(model.state_dict(), f"/scratch/kk6081/ml_fall25/checkpoints/{model_name}_epoch{epoch}.pt")
-        print(f"Saved {model_name} weights to /scratch/kk6081/ml_fall25/checkpoints/{model_name}_epoch{epoch}.pt")
+        checkpoint_path = f"{model_name}_epoch{epoch}.pt"
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"Saved {model_name} weights to {checkpoint_path}")
     
     # Return loss histories for plotting
     return train_loss_history, val_loss_history

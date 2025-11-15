@@ -25,7 +25,7 @@ if [ "$GPU_MODE" = true ]; then
     EPOCHS=3                # Reduced from 5
     BLOCK_SIZE=256          # Reduced from 512 (major memory saver!)
     EMBED_SIZE=384          # Reduced from 512
-    DEVICE="cuda:1"
+    DEVICE="cuda:0"
     MAX_STEPS=""  # No limit
     echo "Configuration: GPU (batch=$BATCH_SIZE, epochs=$EPOCHS, block=$BLOCK_SIZE, embed=$EMBED_SIZE)"
 else

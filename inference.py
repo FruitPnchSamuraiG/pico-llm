@@ -78,7 +78,7 @@ def parse_args():
 
 def load_model(model_type, checkpoint_path, args, device):
     """Load a trained model from checkpoint."""
-    print(f"\n Loading {model_type} model from {checkpoint_path}")
+    print(f"\n🔧 Loading {model_type} model from {checkpoint_path}")
     
     # Initialize tokenizer
     enc = tiktoken.get_encoding("gpt2")
