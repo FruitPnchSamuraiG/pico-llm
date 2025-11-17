@@ -66,6 +66,8 @@ def parse_args():
     parser.add_argument("--disable_lstm", action="store_true", help="Skip training the LSTM baseline model.")
     parser.add_argument("--save_attention_for_prompt", action="store_true", help="Save Transformer attention head heatmaps for the given --prompt.")
     parser.add_argument("--attention_outdir", type=str, default="attn_plots", help="Directory to save attention heatmaps.")
+    parser.add_argument("--norm_type", type=str, default='pre', 
+                        help="TransformerBlock defaults to pre-normailzation. Set this to 'post' for post-normalization")
     
     # Training stability and quality improvements
     # parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm. Prevents exploding gradients.")
@@ -372,11 +374,13 @@ class TransformerBlock(nn.Module):
     - n_heads: Number of attention heads (must divide d_model evenly)
     - ff_mult: Feedforward expansion factor (typically 4x)
     """
-    def __init__(self, d_model, n_heads, ff_mult=4):
+    def __init__(self, d_model, n_heads, ff_mult=4, norm_type='pre'):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        assert norm_type in ['pre', 'post'], "norm_type must be either 'pre or 'post'"
         self.d_model = d_model
         self.n_heads = n_heads
+        self.norm_type = norm_type
         self.head_dim = d_model // n_heads  # Each head processes head_dim features
         
         # Multi-head attention projections
@@ -422,7 +426,10 @@ class TransformerBlock(nn.Module):
         b, t, d = x.shape
         
         # ===== ATTENTION BLOCK =====
-        xa = self.norm_attn(x)  # Pre-norm: normalize BEFORE attention
+        if self.norm_type == 'pre':
+            xa = self.norm_attn(x)  # Pre-norm: normalize BEFORE attention
+        else:
+            xa = x
         
         # Project to Q, K, V and reshape for multi-head attention
         # Shape: (batch, seq_len, d_model) -> (batch, n_heads, seq_len, head_dim)
@@ -450,10 +457,20 @@ class TransformerBlock(nn.Module):
         # Concatenate heads and project
         attn_out = attn_out.transpose(1, 2).contiguous().view(b, t, d)
         x = x + self.out_proj(attn_out)  # Residual connection
+
+        if self.norm_type=='post':
+            x = self.norm_attn(x)  # Post-norm: normalize AFTER attention
         
         # ===== FEEDFORWARD BLOCK =====
-        xf = self.norm_ff(x)  # Pre-norm: normalize BEFORE feedforward
+        if self.norm_type=='pre':
+            xf = self.norm_ff(x)  # Pre-norm: normalize BEFORE feedforward
+        else:
+            xf = x
+
         x = x + self.ff(xf)   # Feedforward with residual
+
+        if self.norm_type=='post':
+            x = self.norm_ff(x)
         
         return x
 
@@ -479,7 +496,7 @@ class TransformerModel(nn.Module):
     - use_pos_emb: Whether to use learned positional embeddings
     """
     def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, 
-                 block_size=1024, ff_mult=4, use_pos_emb=True):
+                 block_size=1024, ff_mult=4, use_pos_emb=True, norm_type='pre'):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -487,6 +504,7 @@ class TransformerModel(nn.Module):
         self.n_blocks = n_blocks
         self.block_size = block_size
         self.use_pos_emb = use_pos_emb
+        self.norm_type=norm_type
         
         # Embedding layers
         self.embed = nn.Embedding(vocab_size, d_model)  # Token embeddings
@@ -497,7 +515,7 @@ class TransformerModel(nn.Module):
         
         # Stack of Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, ff_mult=ff_mult) for _ in range(n_blocks)
+            TransformerBlock(d_model, n_heads, ff_mult=ff_mult, norm_type=norm_type) for _ in range(n_blocks)
         ])
         
         # Final normalization and projection
