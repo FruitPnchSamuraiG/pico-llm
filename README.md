@@ -67,6 +67,12 @@ python plot_losses.py --input loss_histories_baseline.pkl
 python plot_losses.py --input loss_histories_deep_model.pkl --smooth 20 --log
 ```
 
+**Normalization**
+1. Toggle Pre/Post-Normalization by setting --norm_type=pre (default) or --norm_type=post
+2. Enable SGD with no warmup by setting --warmup=no
+3. Enable SGD with warmup by setting --warmup=yes
+
+
 ## Requirements
 - Python 3.8+
 - PyTorch
