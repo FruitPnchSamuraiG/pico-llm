@@ -20,9 +20,9 @@ fi
 
 # Set device and max steps based on mode
 if [ "$GPU_MODE" = true ]; then
-    DEVICE="cuda:0"
+    DEVICE="cuda:1"
     MAX_STEPS=""  # No limit on GPU
-    echo "Device: GPU (cuda:0)"
+    echo "Device: GPU (cuda:1)"
 else
     DEVICE="cpu"
     MAX_STEPS="--max_steps_per_epoch 50"
