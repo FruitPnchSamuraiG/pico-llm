@@ -63,6 +63,9 @@ def parse_args():
     parser.add_argument("--transformer_blocks", type=int, default=2, help="Number of Transformer blocks.")
     parser.add_argument("--ff_mult", type=int, default=4, help="Feedforward expansion multiplier inside Transformer.")
     parser.add_argument("--no_pos_emb", action="store_true", help="Disable learned positional embeddings (for experimentation).")
+    parser.add_argument("--disable_lstm", action="store_true", help="Skip training the LSTM baseline model.")
+    parser.add_argument("--save_attention_for_prompt", action="store_true", help="Save Transformer attention head heatmaps for the given --prompt.")
+    parser.add_argument("--attention_outdir", type=str, default="attn_plots", help="Directory to save attention heatmaps.")
     
     # Training stability and quality improvements
     # parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm. Prevents exploding gradients.")
@@ -392,6 +395,9 @@ class TransformerBlock(nn.Module):
         # Normalization layers (Pre-norm style)
         self.norm_attn = RMSNorm(d_model)
         self.norm_ff = RMSNorm(d_model)
+        # Optional: cache attention probabilities for interpretability/plotting
+        self.save_attention = False
+        self.last_attn_probs = None
 
     def forward(self, x, causal_mask=None):
         """
@@ -435,6 +441,8 @@ class TransformerBlock(nn.Module):
         
         # Softmax to get attention probabilities
         attn_probs = F.softmax(attn_scores, dim=-1)  # (batch, heads, seq_len, seq_len)
+        if self.save_attention:
+            self.last_attn_probs = attn_probs.detach().cpu()
         
         # Apply attention to values
         attn_out = attn_probs @ v  # (batch, heads, seq_len, head_dim)
@@ -1036,22 +1044,21 @@ def main():
         hidden_size=embed_size
     ).to(device)
 
-    transformer = TransformerModel(
-        vocab_size=vocab_size,
-        d_model=embed_size,
-        n_heads=args.transformer_heads,
-        n_blocks=args.transformer_blocks,
-        block_size=block_size,
-        ff_mult=args.ff_mult,
-        use_pos_emb=not args.no_pos_emb
-    ).to(device)
-
     models = {}
     if args.enable_kgram:
         models["kgram_mlp_seq"] = kgram_model
-    # LSTM always included for baseline
-    models["lstm_seq"] = lstm_model
+    if not args.disable_lstm:
+        models["lstm_seq"] = lstm_model
     if args.enable_transformer:
+        transformer = TransformerModel(
+            vocab_size=vocab_size,
+            d_model=embed_size,
+            n_heads=args.transformer_heads,
+            n_blocks=args.transformer_blocks,
+            block_size=block_size,
+            ff_mult=args.ff_mult,
+            use_pos_emb=not args.no_pos_emb
+        ).to(device)
         models["transformer"] = transformer
 
     ############################################################################
@@ -1112,6 +1119,43 @@ def main():
         print(text_topp1)
         print(f"Annotated:\n{ann_topp1}")
         print("--------------------------------------------------")
+
+    # Optionally: save Transformer attention maps for the prompt
+    if args.save_attention_for_prompt and ("transformer" in models):
+        import os
+        os.makedirs(args.attention_outdir, exist_ok=True)
+        transformer_model = models["transformer"]
+        # enable caching
+        for blk in transformer_model.blocks:
+            blk.save_attention = True
+        with torch.no_grad():
+            tok = torch.tensor(enc.encode(args.prompt), dtype=torch.long, device=device).unsqueeze(1)
+            _ = transformer_model(tok)
+        # plot
+        import matplotlib.pyplot as plt
+        pos_flag = 1 if transformer_model.pos_emb is not None else 0
+        for bi, blk in enumerate(transformer_model.blocks):
+            if getattr(blk, "last_attn_probs", None) is None:
+                continue
+            attn = blk.last_attn_probs[0]  # (heads, T, T) for batch 0
+            heads = attn.shape[0]
+            for hi in range(heads):
+                plt.figure(figsize=(5, 4))
+                plt.imshow(attn[hi].numpy(), aspect='auto', origin='lower', cmap='viridis')
+                plt.colorbar()
+                plt.title(f"Block {bi} Head {hi} Attention (pos_emb={pos_flag})")
+                plt.xlabel("Key positions")
+                plt.ylabel("Query positions")
+                out_path = os.path.join(
+                    args.attention_outdir,
+                    f"attn_block{bi}_head{hi}_pos{pos_flag}.png"
+                )
+                plt.tight_layout()
+                plt.savefig(out_path)
+                plt.close()
+        # disable caching
+        for blk in transformer_model.blocks:
+            blk.save_attention = False
 
     # Save loss histories for plotting
     import pickle
