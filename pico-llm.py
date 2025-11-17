@@ -63,8 +63,12 @@ def parse_args():
     parser.add_argument("--transformer_blocks", type=int, default=2, help="Number of Transformer blocks.")
     parser.add_argument("--ff_mult", type=int, default=4, help="Feedforward expansion multiplier inside Transformer.")
     parser.add_argument("--no_pos_emb", action="store_true", help="Disable learned positional embeddings (for experimentation).")
+    
+    # Pre/Post-Normalization Arguments
     parser.add_argument("--norm_type", type=str, default='pre', 
                         help="TransformerBlock defaults to pre-normailzation. Set this to 'post' for post-normalization")
+    parser.add_argument("--warmup", type=str, default='', 
+                        help="Set to 'yes' or 'no'. If set to either, SGD will be enabled instead of Adam")
     
     # Training stability and quality improvements
     # parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm. Prevents exploding gradients.")
@@ -730,6 +734,7 @@ def train_one_model(model,
                     model_name,
                     device,
                     lr=1e-3,
+                    warmup='',
                     log_steps=100,
                     sample_interval=30,
                     max_steps_per_epoch=None,
@@ -762,8 +767,22 @@ def train_one_model(model,
     Returns:
         (train_loss_history, val_loss_history): Tuples of (global_step, loss) for plotting
     """
-    # Use AdamW optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    if warmup=='yes':
+        optimizer = optim.SGD(model.parameters(),lr=lr)
+        warmup_steps = 200
+
+        def linear_warmup(current_step):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            return 1.0
+        
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=linear_warmup)
+
+    elif warmup=='no':
+        optimizer = optim.SGD(model.parameters(), lr=lr)
+    else:
+        # Use AdamW optimizer
+        optimizer = optim.AdamW(model.parameters(), lr=lr)
 
     # Track timing for periodic text generation
     start_time = time.time()
@@ -801,6 +820,8 @@ def train_one_model(model,
             
             # Update model parameters
             optimizer.step()
+            if warmup=='yes':
+                scheduler.step()
 
             # Track loss statistics
             total_loss += loss.item()
@@ -916,6 +937,7 @@ def main():
     batch_size = args.batch_size  # Number of sequences per batch
     num_epochs = args.num_epochs  # Number of full dataset passes
     learning_rate = args.learning_rate  # Optimizer step size
+    warmup = args.warmup # Enable SGD, toggle warmup
 
     block_size = args.block_size  # Maximum sequence length
     train_subset_size = 20000
@@ -1066,10 +1088,10 @@ def main():
     ).to(device)
 
     models = {}
-    if args.enable_kgram:
-        models["kgram_mlp_seq"] = kgram_model
+    #if args.enable_kgram:
+    #    models["kgram_mlp_seq"] = kgram_model
     # LSTM always included for baseline
-    models["lstm_seq"] = lstm_model
+    #models["lstm_seq"] = lstm_model
     if args.enable_transformer:
         models["transformer"] = transformer
 
@@ -1087,6 +1109,7 @@ def main():
             model_name=model_name,
             device=device,
             lr=learning_rate,
+            warmup=warmup,
             log_steps=log_interval_steps,
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,

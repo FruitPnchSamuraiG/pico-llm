@@ -1,0 +1,227 @@
+--device_id=cpu --norm_type=post --warmup=no --learning_rate=0.5 --block_size=32 
+--embed_size=384 --enable_transformer --max_steps_per_epoch=50
+    tl_sgd_post_nwu1
+    transformer:
+    📈 TRAINING:
+        Initial loss: 10.9409
+        Final loss:   3.4832
+        Min loss:     3.0068
+        Improvement:  7.4577 (68.2% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 4.6804
+        Final loss:   3.7101
+        Min loss:     3.7101
+        Train/Val gap: 0.2269 (good fit)
+
+    tl_sgd_post_nwu2
+    (ERROR)
+    epoch: 3, step_in_epoch: 32
+    probability tensor contains either `inf`, `nan` or element < 0
+        - note: model.blocks[0].q_proj.weight (and v_proj, k_proj) are all nan
+
+    tl_sgd_post_nwu3
+    transformer:
+    📈 TRAINING:
+        Initial loss: 10.9777
+        Final loss:   5.8584
+        Min loss:     5.1720
+        Improvement:  5.1193 (46.6% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 6.2107
+        Final loss:   5.9767
+        Min loss:     5.9094
+        Train/Val gap: 0.1183 (good fit)
+
+    tl_sgd_post_nwu4
+    (ERROR)
+    epoch: 3, step_in_epoch: 35
+
+    tl_sgd_post_nwu5
+    transformer:
+    📈 TRAINING:
+        Initial loss: 11.0359
+        Final loss:   3.7696
+        Min loss:     3.1202
+        Improvement:  7.2663 (65.8% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 4.6243
+        Final loss:   3.7094
+        Min loss:     3.7094
+        Train/Val gap: -0.0602 (good fit)
+
+    tl_sgd_post_nwu6
+    (ERROR)
+    epoch: 3, step_in_epoch: 33
+
+    tl_sgd_post_nwu7
+    (ERROR)
+    epoch: 3, step_in_epoch: 32
+
+    tl_sgd_post_nwu8
+    (ERROR)    
+    epoch: 3, step_in_epoch: 29
+
+    tl_sgd_post_nwu9
+    (ERROR)    
+    epoch: 3, step_in_epoch: 33
+
+    tl_sgd_post_nwu10
+    transformer:
+    📈 TRAINING:
+        Initial loss: 10.9506
+        Final loss:   5.9206
+        Min loss:     5.4243
+        Improvement:  5.0300 (45.9% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 6.4142
+        Final loss:   5.8876
+        Min loss:     5.8876
+        Train/Val gap: -0.0330 (good fit)
+
+
+--device_id=cpu --norm_type=pre --warmup=no --learning_rate=0.5 --block_size=32 
+--embed_size=384 --enable_transformer --max_steps_per_epoch=50
+
+    tl_sgd_pre_nwu1
+    transformer:
+    📈 TRAINING:
+        Initial loss: 10.9551
+        Final loss:   3.8071
+        Min loss:     3.3576
+        Improvement:  7.1480 (65.2% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 4.4785
+        Final loss:   3.8208
+        Min loss:     3.8208
+        Train/Val gap: 0.0137 (good fit)
+    
+    tl_sgd_pre_nwu2
+    transformer:
+    📈 TRAINING:
+        Initial loss: 11.0303
+        Final loss:   3.3936
+        Min loss:     2.7885
+        Improvement:  7.6367 (69.2% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 4.7114
+        Final loss:   3.7652
+        Min loss:     3.7652
+        Train/Val gap: 0.3717 (good fit)
+
+    tl_sgd_pre_nwu3
+    transformer:
+    📈 TRAINING:
+        Initial loss: 10.9474
+        Final loss:   3.7724
+        Min loss:     2.9327
+        Improvement:  7.1751 (65.5% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 4.5720
+        Final loss:   3.8975
+        Min loss:     3.8975
+        Train/Val gap: 0.1251 (good fit)
+
+    tl_sgd_pre_nwu4
+    transformer:
+    📈 TRAINING:
+        Initial loss: 11.0137
+        Final loss:   3.4887
+        Min loss:     3.4769
+        Improvement:  7.5250 (68.3% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 5.2370
+        Final loss:   3.9699
+        Min loss:     3.9699
+        Train/Val gap: 0.4811 (good fit)
+
+    tl_sgd_pre_nwu5
+    transformer:
+    📈 TRAINING:
+        Initial loss: 11.0583
+        Final loss:   4.0122
+        Min loss:     3.0370
+        Improvement:  7.0460 (63.7% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 4.5956
+        Final loss:   3.9027
+        Min loss:     3.9027
+        Train/Val gap: -0.1095 (good fit)
+
+    tl_sgd_pre_nwu6
+    transformer:
+    📈 TRAINING:
+        Initial loss: 10.9865
+        Final loss:   4.1984
+        Min loss:     3.1752
+        Improvement:  6.7881 (61.8% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 4.9040
+        Final loss:   3.7973
+        Min loss:     3.7973
+        Train/Val gap: -0.4011 (good fit)
+
+    tl_sgd_pre_nwu7
+    transformer:
+    📈 TRAINING:
+        Initial loss: 10.9629
+        Final loss:   4.2385
+        Min loss:     3.2135
+        Improvement:  6.7244 (61.3% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 4.9721
+        Final loss:   3.9129
+        Min loss:     3.9129
+        Train/Val gap: -0.3256 (good fit)
+
+    tl_sgd_pre_nwu8
+    transformer:
+    📈 TRAINING:
+        Initial loss: 11.0000
+        Final loss:   3.6258
+        Min loss:     3.2373
+        Improvement:  7.3742 (67.0% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 5.2597
+        Final loss:   3.9391
+        Min loss:     3.9391
+        Train/Val gap: 0.3133 (good fit)
+
+    tl_sgd_pre_nwu9
+    transformer:
+    📈 TRAINING:
+        Initial loss: 10.9976
+        Final loss:   4.1284
+        Min loss:     3.4016
+        Improvement:  6.8692 (62.5% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 4.7106
+        Final loss:   4.1566
+        Min loss:     3.9944
+        Train/Val gap: 0.0283 (good fit)
+
+    tl_sgd_pre_nwu10
+    transformer:
+    📈 TRAINING:
+        Initial loss: 11.0094
+        Final loss:   5.9106
+        Min loss:     4.9470
+        Improvement:  5.0988 (46.3% reduction)
+        Total steps:  150
+    📊 VALIDATION:
+        Initial loss: 6.6558
+        Final loss:   5.4545
+        Min loss:     5.4545
+        Train/Val gap: -0.4560 (good fit)
