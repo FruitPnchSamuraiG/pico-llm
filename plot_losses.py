@@ -106,7 +106,7 @@ def plot_losses(loss_histories, output_file="training_losses.png", smooth_window
     
     plt.xlabel("Training Step", fontsize=14, fontweight='bold')
     plt.ylabel("Cross-Entropy Loss", fontsize=14, fontweight='bold')
-    plt.title("Training & Validation Loss: K-gram MLP vs LSTM vs Transformer", fontsize=16, pad=20, fontweight='bold')
+    plt.title("Training & Validation Loss", fontsize=16, pad=20, fontweight='bold')
     plt.legend(fontsize=11, loc='best', framealpha=0.9)
     plt.grid(True, alpha=0.3, linestyle='--')
     
@@ -155,36 +155,57 @@ def plot_losses(loss_histories, output_file="training_losses.png", smooth_window
 def main():
     parser = argparse.ArgumentParser(description="Plot training loss curves")
     parser.add_argument("--input", type=str, default="loss_histories.pkl",
-                       help="Input pickle file with loss histories")
+                        help="Single input pickle file with loss histories")
+    parser.add_argument("--multi", nargs="*", default=None,
+                        help="Multiple pickle files with optional renaming syntax file:label. Example: --multi loss_histories_pos_emb.pkl:transformer_pos_emb loss_histories_no_pos_emb.pkl:transformer_no_pos_emb")
     parser.add_argument("--output", type=str, default="training_losses.png",
-                       help="Output image file")
+                        help="Output image file")
     parser.add_argument("--smooth", type=int, default=10,
-                       help="Moving average window size (1=no smoothing)")
+                        help="Moving average window size (1=no smoothing)")
     parser.add_argument("--log", action="store_true",
-                       help="Use log scale for y-axis")
+                        help="Use log scale for y-axis")
     args = parser.parse_args()
-    
-    # Load loss histories
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"❌ Error: {args.input} not found!")
-        print(f"Make sure you've run training with pico-llm.py first.")
-        return
-    
-    print(f"Loading loss histories from {args.input}...")
-    with open(args.input, "rb") as f:
-        loss_histories = pickle.load(f)
-    
+
+    if args.multi:
+        merged = {}
+        for item in args.multi:
+            if ':' in item:
+                path_str, label = item.split(':', 1)
+            else:
+                path_str, label = item, None
+            p = Path(path_str)
+            if not p.exists():
+                print(f"⚠️ Skipping missing file: {path_str}")
+                continue
+            with open(p, 'rb') as f:
+                data = pickle.load(f)
+            # Expect single transformer key 'transformer' or others
+            for k, v in data.items():
+                new_key = label if label is not None else k
+                # Avoid overwriting
+                if new_key in merged:
+                    new_key = new_key + "_dup"
+                merged[new_key] = v
+        loss_histories = merged
+    else:
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"❌ Error: {args.input} not found!")
+            print("Provide existing pickle or use --multi with files.")
+            return
+        print(f"Loading loss histories from {args.input}...")
+        with open(args.input, "rb") as f:
+            loss_histories = pickle.load(f)
+
     print(f"Found {len(loss_histories)} models:")
     for model_name in loss_histories.keys():
         print(f"  - {model_name}")
-    
-    # Plot
-    plot_losses(loss_histories, 
-               output_file=args.output, 
-               smooth_window=args.smooth,
-               log_scale=args.log)
-    
+
+    plot_losses(loss_histories,
+                output_file=args.output,
+                smooth_window=args.smooth,
+                log_scale=args.log)
+
     print(f"\n🎉 Done! Open {args.output} to view the plot.")
 
 
