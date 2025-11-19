@@ -7,11 +7,6 @@ This repository contains implementations of three language modeling approaches:
 2. **LSTM**: Recurrent neural network with long short-term memory
 3. **Transformer**: Attention-based decoder-only model (GPT-style)
 
-## Branch Merge Information
-This branch (`copilot/merge-kgram-mlp-section`) merges the best components from:
-- **siva/pico-llm**: Optimized K-gram MLP using vectorized operations (unfold)
-- **keshav-pico**: Better documentation, helper scripts, and utilities
-
 ### Key Features
 - **Optimized K-gram MLP**: Uses `unfold()` for vectorized sliding window processing (much faster than nested loops)
 - **Helper Scripts**:
@@ -67,7 +62,7 @@ python plot_losses.py --input loss_histories_baseline.pkl
 python plot_losses.py --input loss_histories_deep_model.pkl --smooth 20 --log
 ```
 
-**Normalization**
+## Normalization
 1. Toggle Pre/Post-Normalization by setting --norm_type=pre (default) or --norm_type=post
 2. Enable SGD with no warmup by setting --warmup=no
 3. Enable SGD with warmup by setting --warmup=yes
