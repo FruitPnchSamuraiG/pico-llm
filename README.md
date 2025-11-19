@@ -72,6 +72,43 @@ python plot_losses.py --input loss_histories_deep_model.pkl --smooth 20 --log
 2. Enable SGD with no warmup by setting --warmup=no
 3. Enable SGD with warmup by setting --warmup=yes
 
+## Interpretability & Analysis
+
+### Attention Head Visualization
+
+Visualize what Transformer attention heads are learning by saving heatmaps for any prompt:
+
+```bash
+# Save attention maps with positional embeddings
+python3 pico-llm.py \
+  --enable_transformer --disable_lstm \
+  --device_id cpu \
+  --tinystories_weight 0.0 --input_files 3seqs.txt \
+  --block_size 128 --batch_size 4 --num_epochs 1 --max_steps_per_epoch 2 \
+  --save_attention_for_prompt --attention_outdir attn_plots_pos \
+  --prompt "Once upon a time"
+
+# Compare without positional embeddings
+python3 pico-llm.py \
+  --enable_transformer --disable_lstm \
+  --device_id cpu \
+  --tinystories_weight 0.0 --input_files 3seqs.txt \
+  --block_size 128 --batch_size 4 --num_epochs 1 --max_steps_per_epoch 2 \
+  --no_pos_emb --save_attention_for_prompt --attention_outdir attn_plots_nopos \
+  --prompt "Once upon a time"
+```
+
+**Output**: PNG heatmaps named `attn_block{B}_head{H}_pos{0|1}.png`
+- **Y-axis**: Query positions (tokens asking for info)
+- **X-axis**: Key positions (tokens being attended to)
+- **Brightness**: Attention probability (brighter = more attention)
+
+**What to Look For:**
+- **Diagonal patterns**: Local attention (syntax-focused heads)
+- **Vertical stripes**: Attention to specific positions (punctuation, first token)
+- **Lower triangular**: Causal constraint (can't attend to future)
+- **Head specialization**: Different heads learning different patterns
+
 
 ## Requirements
 - Python 3.8+
