@@ -86,6 +86,13 @@ def parse_args():
         help="Directory to write checkpoints and loss histories (default: /scratch/kk6081/picollm_extend).",
     )
 
+    parser.add_argument(
+        "--init_from",
+        type=str,
+        default="",
+        help="Optional path to a .pt state_dict to initialize the Transformer from (for finetuning).",
+    )
+
     args = parser.parse_args()
     return args
 
@@ -1111,6 +1118,16 @@ def main():
             ff_mult=args.ff_mult,
             use_pos_emb=not args.no_pos_emb
         ).to(device)
+
+        # Optional: initialize from checkpoint (finetuning)
+        if args.init_from:
+            import os
+            if not os.path.exists(args.init_from):
+                raise FileNotFoundError(f"--init_from checkpoint not found: {args.init_from}")
+            print(f"Loading Transformer weights from --init_from: {args.init_from}")
+            state = torch.load(args.init_from, map_location=device)
+            transformer.load_state_dict(state)
+
         models["transformer"] = transformer
 
     ############################################################################

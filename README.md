@@ -10,62 +10,104 @@ This repository contains implementations of three language modeling approaches:
 ### Key Features
 - **Optimized K-gram MLP**: Uses `unfold()` for vectorized sliding window processing (much faster than nested loops)
 - **Helper Scripts**:
-  - `inference.py`: Run inference on trained models
+  - `inference.py`: Run inference / decoding experiments
   - `plot_losses.py`: Plot training curves
   - `train_all_models.sh`: Convenient training script for all models
-- **Well-documented code**: Comprehensive comments explaining architecture and algorithms
+
+## Environment / constraints (project settings)
+- GPU: 2× GTX TITAN X (12GB); project runs on **`cuda:0`** by default.
+- Venv: `/scratch/kk6081/ml_fall25/venv/`
+- Checkpoints/artifacts: **`/scratch/kk6081/picollm_extend/`** (see `--checkpoint_dir`)
+- Focus: **Transformer-only improvements** (test-time search + reasoning finetune)
+
+## High-level flow (Transformer-only)
+
+```mermaid
+flowchart TD
+  A[Train base Transformer\nTinyStories + optional text] -->|checkpoint| B[Decode / Test-Time Search\n(nucleus, beam, lookahead/LNS)]
+  B --> C[Quantitative decode metrics\n(distinct-1/2, rep-4, time)]
+  A -->|init_from| D[Reasoning finetune\n(OpenThoughts-114k → text lines)]
+  D --> E[Reasoning accuracy eval\nextract answer + compare]
+```
 
 ## Quick Start
 
-### Training with Multiple Configurations
-The `train_all_models.sh` script runs 4 different hyperparameter configurations automatically:
+Activate the required environment:
 
 ```bash
-# Quick CPU test - runs all 4 configurations
-bash train_all_models.sh
-
-# GPU training - runs all 4 configurations on GPU
-bash train_all_models.sh --gpu
+source /scratch/kk6081/ml_fall25/venv/bin/activate
 ```
 
-**Configurations:**
-1. **baseline**: Small model (k=3, embed=256) - fastest, good for testing
-2. **large_embed**: Larger embeddings (k=3, embed=512) - better capacity
-3. **wide_context**: Wider context window (k=5, embed=384) - longer history
-4. **deep_model**: Deeper architecture (k=4, 4 blocks, embed=384) - more layers
+### 1) Fast dev: train a small Transformer checkpoint
 
-Each configuration generates:
-- `training_losses_[config].png` - Loss comparison plot
-- `loss_histories_[config].pkl` - Raw loss data
-- `*_epoch*_[config].pt` - Model checkpoints
-
-### Custom Training
 ```bash
-python pico-llm.py --enable_kgram --enable_transformer \
-    --batch_size 16 --num_epochs 3 --device_id cuda:0
+bash scripts/train_transformer_fast.sh
 ```
 
-### Inference
+Outputs (default):
+- `/scratch/kk6081/picollm_extend/transformer_epoch*.pt`
+- `/scratch/kk6081/picollm_extend/loss_histories.pkl`
+
+### 2) Test-time decoding/search experiments
+
+`inference.py` supports these decoding modes (Transformer):
+- `--decode greedy`
+- `--decode nucleus`
+- `--decode beam`
+- `--decode lookahead` (Lookahead Nucleus Search / LNS)
+
+Example grid (fast settings):
+
 ```bash
-python inference.py --model transformer \
-    --checkpoint transformer_epoch3_baseline.pt \
-    --prompt "Once upon a time" \
-    --max_tokens 100
+bash scripts/run_tts_grid.sh transformer_epoch1.pt "Once upon a time" --fast
 ```
 
-### Plot Results
+### 3) Reasoning finetune using an existing dataset (Hugging Face)
+
+Default reasoning dataset:
+- `open-thoughts/OpenThoughts-114k`
+
+Finetune script:
+
 ```bash
-# Plot a specific configuration
-python plot_losses.py --input loss_histories_baseline.pkl
-
-# With smoothing and log scale
-python plot_losses.py --input loss_histories_deep_model.pkl --smooth 20 --log
+bash scripts/train_transformer_reasoning.sh
 ```
+
+Notes:
+- Uses `--init_from /scratch/kk6081/picollm_extend/transformer_epoch1.pt` by default.
+- Writes finetune checkpoints in an isolated subdir then copies them back as:
+  - `/scratch/kk6081/picollm_extend/transformer_reasoning_transformer_epoch*.pt`
+
+### 4) Reasoning evaluation (accuracy)
+
+```bash
+python scripts/eval_reasoning.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_reasoning_transformer_epoch1.pt \
+  --data data/open_thoughts_val.txt \
+  --decode greedy
+```
+
+You can compare test-time strategies on the reasoning prompts too:
+- `--decode nucleus`
+- `--decode beam`
+- `--decode lookahead`
+
+## What is Lookahead Nucleus Search (LNS)?
+
+At each generation step:
+1. Compute the model distribution for the next token.
+2. Take the top-`K` candidate tokens by log-probability.
+3. For each candidate, do a short rollout of length `H` (sampling with nucleus/top-p).
+4. Score each candidate:
+
+**Score = average logprob(rollout) − rep_penalty * repetition(rollout)**
+
+Then pick the candidate with the best score.
 
 ## Normalization
-1. Toggle Pre/Post-Normalization by setting --norm_type=pre (default) or --norm_type=post
-2. Enable SGD with no warmup by setting --warmup=no
-3. Enable SGD with warmup by setting --warmup=yes
+1. Toggle Pre/Post-Normalization by setting `--norm_type=pre` (default) or `--norm_type=post`
+2. Enable SGD with no warmup by setting `--warmup=no`
+3. Enable SGD with warmup by setting `--warmup=yes`
 
 ## Interpretability & Analysis
 
@@ -74,7 +116,6 @@ python plot_losses.py --input loss_histories_deep_model.pkl --smooth 20 --log
 Visualize what Transformer attention heads are learning by saving heatmaps for any prompt:
 
 ```bash
-# Save attention maps with positional embeddings
 python3 pico-llm.py \
   --enable_transformer --disable_lstm \
   --device_id cpu \
@@ -82,38 +123,7 @@ python3 pico-llm.py \
   --block_size 128 --batch_size 4 --num_epochs 1 --max_steps_per_epoch 2 \
   --save_attention_for_prompt --attention_outdir attn_plots_pos \
   --prompt "Once upon a time"
-
-# Compare without positional embeddings
-python3 pico-llm.py \
-  --enable_transformer --disable_lstm \
-  --device_id cpu \
-  --tinystories_weight 0.0 --input_files 3seqs.txt \
-  --block_size 128 --batch_size 4 --num_epochs 1 --max_steps_per_epoch 2 \
-  --no_pos_emb --save_attention_for_prompt --attention_outdir attn_plots_nopos \
-  --prompt "Once upon a time"
 ```
-
-**Output**: PNG heatmaps named `attn_block{B}_head{H}_pos{0|1}.png`
-- **Y-axis**: Query positions (tokens asking for info)
-- **X-axis**: Key positions (tokens being attended to)
-- **Brightness**: Attention probability (brighter = more attention)
-
-**What to Look For:**
-- **Diagonal patterns**: Local attention (syntax-focused heads)
-- **Vertical stripes**: Attention to specific positions (punctuation, first token)
-- **Lower triangular**: Causal constraint (can't attend to future)
-- **Head specialization**: Different heads learning different patterns
-
-## Test-Time Search (TTS) Extension (new)
-
-A Transformer-only **test-time search** extension (Lookahead Nucleus Search / LNS) was added.
-
-See: `README_TTS.md`
-
-Key entry points:
-- `scripts/train_transformer_fast.sh`  fast dev training on `cuda:0`
-- `scripts/run_tts_grid.sh`  compare `nucleus` vs `beam` vs `lookahead`
-- `inference.py`  new `--decode {greedy,nucleus,beam,lookahead}`
 
 ## Requirements
 - Python 3.8+
