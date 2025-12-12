@@ -104,6 +104,16 @@ python3 pico-llm.py \
 - **Lower triangular**: Causal constraint (can't attend to future)
 - **Head specialization**: Different heads learning different patterns
 
+## Test-Time Search (TTS) Extension (new)
+
+A Transformer-only **test-time search** extension (Lookahead Nucleus Search / LNS) was added.
+
+See: `README_TTS.md`
+
+Key entry points:
+- `scripts/train_transformer_fast.sh`  fast dev training on `cuda:0`
+- `scripts/run_tts_grid.sh`  compare `nucleus` vs `beam` vs `lookahead`
+- `inference.py`  new `--decode {greedy,nucleus,beam,lookahead}`
 
 ## Requirements
 - Python 3.8+

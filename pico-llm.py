@@ -78,6 +78,14 @@ def parse_args():
     # Validation split
     parser.add_argument("--val_split", type=float, default=0.1, help="Fraction of data to use for validation (0.1 = 10 percent)")
 
+    # Checkpoint / artifact output directory
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="/scratch/kk6081/picollm_extend",
+        help="Directory to write checkpoints and loss histories (default: /scratch/kk6081/picollm_extend).",
+    )
+
     args = parser.parse_args()
     return args
 
@@ -749,7 +757,8 @@ def train_one_model(model,
                     prompt="Once upon a",
                     grad_clip=1.0,
                     weight_decay=0.01,
-                    val_loader=None):
+                    val_loader=None,
+                    checkpoint_dir: str = "."):
     """
     Train a single model (LSTM, Transformer, or K-gram MLP) on the provided data.
     
@@ -769,6 +778,7 @@ def train_one_model(model,
         grad_clip: Gradient clipping norm to prevent exploding gradients
         weight_decay: L2 regularization strength (AdamW)
         val_loader: Optional validation DataLoader
+        checkpoint_dir: Directory to save checkpoints and loss histories
     
     Returns:
         (train_loss_history, val_loss_history): Tuples of (global_step, loss) for plotting
@@ -920,7 +930,9 @@ def train_one_model(model,
             model.train()  # Back to training mode
 
         # Save model checkpoint after each epoch (allows resuming training)
-        checkpoint_path = f"{model_name}_epoch{epoch}.pt"
+        import os
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}_epoch{epoch}.pt")
         torch.save(model.state_dict(), checkpoint_path)
         print(f"Saved {model_name} weights to {checkpoint_path}")
     
@@ -962,6 +974,8 @@ def main():
         device = torch.device(requested_device_id)
 
     print(f"Using device: {device}, block_size={block_size}, kgram_k={k}, chunk_size={chunk_size}, embed_size={embed_size}")
+
+    checkpoint_dir = args.checkpoint_dir
 
     ############################################################################
     # Data Loading and Tokenization
@@ -1118,8 +1132,9 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
-            prompt=args.prompt,  # user-specified prompt here
-            val_loader=val_loader  # Pass validation loader
+            prompt=args.prompt,
+            val_loader=val_loader,
+            checkpoint_dir=checkpoint_dir,
         )
         
         # Store loss histories (both train and val)
@@ -1198,10 +1213,13 @@ def main():
 
     # Save loss histories for plotting
     import pickle
-    with open("loss_histories.pkl", "wb") as f:
+    import os
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    loss_path = os.path.join(checkpoint_dir, "loss_histories.pkl")
+    with open(loss_path, "wb") as f:
         pickle.dump(all_loss_histories, f)
-    print("\n✅ Saved loss histories to loss_histories.pkl")
-    print("Run 'python plot_losses.py' to visualize training curves!")
+    print(f"\n✅ Saved loss histories to {loss_path}")
+    print("Run 'python plot_losses.py --input <that_file>' to visualize training curves!")
     
     # Finally, let's share how I'm feeling:
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
