@@ -24,10 +24,10 @@ This repository contains implementations of three language modeling approaches:
 
 ```mermaid
 flowchart TD
-  A[Train base Transformer<br/>TinyStories + optional text] -->|checkpoint| B[Decode / Test-Time Search<br/>greedy / nucleus / beam / lookahead (LNS)]
-  B --> C[Decode metrics<br/>distinct-1/2, rep-4, wall time]
-  A -->|init_from| D[Reasoning finetune<br/>OpenThoughts-114k → text lines]
-  D --> E[Reasoning eval<br/>task-specific accuracy]
+  A[Train base Transformer<br/>TinyStories plus optional text] -->|checkpoint| B[Decode test time search<br/>greedy nucleus beam lookahead LNS]
+  B --> C[Decode metrics<br/>distinct1 distinct2 rep4 walltime]
+  A -->|init_from| D[Reasoning finetune<br/>OpenThoughts 114k to text lines]
+  D --> E[Reasoning eval<br/>task specific accuracy]
 ```
 
 ## Quick Start
