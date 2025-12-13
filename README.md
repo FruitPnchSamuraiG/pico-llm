@@ -21,8 +21,8 @@ flowchart TD
   VENV[Activate venv<br/>/scratch/kk6081/ml_fall25/venv/] --> BASE
 
   subgraph BASE["Stage 1: Base Transformer training on TinyStories"]
-    TFAST[bash scripts/train_transformer_fast.sh<br/>200k stories 3 epochs]
-    TFULL[bash scripts/train_transformer_full.sh<br/>500k stories 5 epochs RECOMMENDED]
+    TFAST[train_transformer_fast.sh<br/>200k stories 3 epochs]
+    TFULL[train_transformer_full.sh<br/>500k stories 5 epochs<br/>RECOMMENDED]
     TFAST --> CKPT1[transformer_epoch_N.pt]
     TFULL --> CKPT1
   end
@@ -31,61 +31,56 @@ flowchart TD
   CKPT1 -->|init_from| CURR
   CKPT1 -->|init_from| GSM
 
-  subgraph OT["Stage 2A: OpenThoughts SFT no RL"]
-    OTDATA[python scripts/prepare_hf_reasoning_data.py<br/>dataset: open-thoughts/OpenThoughts-114k] --> OTFILES[data/open_thoughts_train.txt<br/>data/open_thoughts_val.txt]
-    OTSFT[bash scripts/train_transformer_reasoning.sh<br/>2 epochs SFT] --> OTCKPT[transformer_reasoning_epoch_N.pt]
-    OTFILES --> OTSFT
+  subgraph OT["Stage 2A: OpenThoughts SFT"]
+    OTDATA[prepare_hf_reasoning_data.py<br/>OpenThoughts-114k] --> OTFILES[open_thoughts_train.txt<br/>open_thoughts_val.txt]
+    OTFILES --> OTSFT[train_transformer_reasoning.sh<br/>2 epochs SFT]
+    OTSFT --> OTCKPT[transformer_reasoning_epoch_N.pt]
   end
 
   subgraph CURR["Stage 2B: Curriculum Learning RECOMMENDED"]
-    CURDATA[bash scripts/train_curriculum_math.sh<br/>Auto-downloads HuggingFace datasets]
-    CURDATA --> ARITHDATA[python scripts/prepare_hf_arithmetic_data.py<br/>ASDiv MathQA Simple]
-    ARITHDATA --> ARITHFILES[data/curriculum_arith_train.txt<br/>data/curriculum_arith_val.txt]
-    ARITHFILES --> ARITHSFT[Arithmetic SFT 3 epochs<br/>Elementary math problems]
-    ARITHSFT --> ARITHCKPT[curriculum_arith/transformer_epoch_N.pt]
-    ARITHCKPT --> CURRGSM[GSM8K SFT 8-10 epochs<br/>Complex reasoning]
-    CURRGSM --> CURRGSMCKPT[curriculum_gsm8k/transformer_epoch_N.pt]
-    
-    CURRGSMCKPT -->|RUN_RL=1 default| CURRRL
-    subgraph CURRRL["RL Refinement best-of-n"]
-      CURRRLSTEP[python scripts/rl_reasoning_outcome.py<br/>400 steps] --> CURRCKPT[curriculum_gsm8k/transformer_rl.pt]
-    end
+    CURRSTART[train_curriculum_math.sh<br/>Auto-downloads HF datasets]
+    CURRSTART --> ARITHDATA[prepare_hf_arithmetic_data.py<br/>ASDiv + Simple arithmetic]
+    ARITHDATA --> ARITHFILES[curriculum_arith_train.txt]
+    ARITHFILES --> ARITHSFT[Arithmetic SFT<br/>3 epochs]
+    ARITHSFT --> ARITHCKPT[arith checkpoint]
+    ARITHCKPT --> CURRGSM[GSM8K SFT<br/>8 epochs]
+    CURRGSM --> CURRGSMCKPT[gsm8k checkpoint]
+    CURRGSMCKPT --> CURRRL[RL Refinement<br/>400 steps]
+    CURRRL --> CURRCKPT[Final RL checkpoint<br/>35-50% accuracy]
   end
 
-  subgraph GSM["Stage 2C: Direct GSM8K SFT + RL"]
-    GSM_PREP[bash scripts/prepare_hf_gsm8k_data.sh<br/>dataset: openai/gsm8k] --> GSMFILES[data/gsm8k_train.txt<br/>data/gsm8k_val.txt<br/>data/gsm8k_test.txt]
-    GSMSFT[bash scripts/train_transformer_gsm8k.sh<br/>8 epochs SFT] --> GSMCKPT[finetune_gsm8k/transformer_epoch_N.pt]
-    GSMFILES --> GSMSFT
-
-    GSMSFT -->|RUN_RL=1 default| RLOUT
-    subgraph RLOUT["RL Refinement best-of-n"]
-      RL[python scripts/rl_reasoning_outcome.py<br/>400 steps] --> RLCKPT[rl_gsm8k/transformer_rl.pt]
-    end
+  subgraph GSM["Stage 2C: Direct GSM8K"]
+    GSM_PREP[prepare_hf_gsm8k_data.sh<br/>openai/gsm8k] --> GSMFILES[gsm8k_train.txt<br/>gsm8k_val.txt]
+    GSMFILES --> GSMSFT[train_transformer_gsm8k.sh<br/>8 epochs SFT]
+    GSMSFT --> GSMCKPT[gsm8k checkpoint]
+    GSMCKPT --> GSMRL[RL Refinement<br/>400 steps]
+    GSMRL --> RLCKPT[Final RL checkpoint<br/>20-35% accuracy]
   end
 
   subgraph EVAL["Evaluation"]
-    E1[python scripts/eval_reasoning.py<br/>Accuracy on GSM8K test set]
+    E1[eval_reasoning.py<br/>Test set accuracy]
   end
 
   OTCKPT --> E1
   CURRCKPT --> E1
-  GSMCKPT --> E1
   RLCKPT --> E1
 
   subgraph INTERP["Interpretability"]
-    IT[python scripts/interpret_transformer.py<br/>Attention logit_lens neurons] --> IOUT[interpretability output dir]
-    IOUT --> VIEW[python scripts/interpretability_viewer.py<br/>Web UI]
+    IT[interpret_transformer.py]
+    IT --> IOUT[Attention + Neurons]
+    IOUT --> VIEW[interpretability_viewer.py<br/>Web UI]
   end
 
   CKPT1 --> IT
   OTCKPT --> IT
   CURRCKPT --> IT
-  GSMCKPT --> IT
   RLCKPT --> IT
 
-  style CURR fill:#e1f5e1
-  style TFULL fill:#e1f5e1
-  style ARITHDATA fill:#ffe1e1
+  classDef recommended fill:#d4edda,stroke:#28a745,stroke-width:3px
+  classDef warning fill:#fff3cd,stroke:#ffc107,stroke-width:2px
+  
+  class CURR,TFULL,CURRSTART,CURRCKPT recommended
+  class TFAST,GSM warning
 ```
 
 ## Environment / constraints
