@@ -69,9 +69,12 @@ flowchart TD
 
   classDef recommended fill:#d4edda,stroke:#28a745,stroke-width:3px,color:#000
   classDef warning fill:#fff3cd,stroke:#ffc107,stroke-width:2px,color:#000
+  classDef default fill:#f0f0f0,stroke:#333,stroke-width:2px,color:#000
   
   class CURR,TFULL,CURRSTART,CURRCKPT recommended
   class TFAST,GSM warning
+  
+  linkStyle default stroke:#333,stroke-width:2px
 ```
 
 ## Environment / constraints
