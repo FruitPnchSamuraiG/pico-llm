@@ -39,6 +39,13 @@ MAX_STEPS=${MAX_STEPS:-300}
 LR=${LR:-2e-4}
 VAL_SPLIT=${VAL_SPLIT:-0.05}
 
+# Faster training knobs (override via env vars)
+SAMPLE_INTERVAL_SECONDS=${SAMPLE_INTERVAL_SECONDS:-600}
+SAMPLE_EVERY_STEPS=${SAMPLE_EVERY_STEPS:-0}
+LR_SCHEDULE=${LR_SCHEDULE:-cosine}
+LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-200}
+LR_MIN_RATIO=${LR_MIN_RATIO:-0.1}
+
 BASE_CKPT=${BASE_CKPT:-$OUTDIR/transformer_epoch1.pt}
 PROMPT=${PROMPT:-"Q: Compute ( 3 + 2 ) - 1. Let's think step by step. A:"}
 
@@ -61,6 +68,8 @@ echo "val_txt=$VAL_TXT"
 echo "base_ckpt=$BASE_CKPT"
 echo "block_size=$BLOCK_SIZE embed=$EMBED heads=$HEADS blocks=$BLOCKS ff_mult=$FF_MULT"
 echo "batch=$BATCH epochs=$EPOCHS max_steps_per_epoch=$MAX_STEPS lr=$LR"
+echo "sample_interval_seconds=$SAMPLE_INTERVAL_SECONDS sample_every_steps=$SAMPLE_EVERY_STEPS"
+echo "lr_schedule=$LR_SCHEDULE lr_warmup_steps=$LR_WARMUP_STEPS lr_min_ratio=$LR_MIN_RATIO"
 echo "=========================================="
 
 # Convert HF dataset -> plain text files (only if missing)
@@ -89,7 +98,12 @@ python pico-llm.py \
   --transformer_heads "$HEADS" --transformer_blocks "$BLOCKS" --ff_mult "$FF_MULT" \
   --learning_rate "$LR" \
   --val_split "$VAL_SPLIT" \
-  --prompt "$PROMPT"
+  --prompt "$PROMPT" \
+  --sample_interval_seconds "$SAMPLE_INTERVAL_SECONDS" \
+  --sample_every_steps "$SAMPLE_EVERY_STEPS" \
+  --lr_schedule "$LR_SCHEDULE" \
+  --lr_warmup_steps "$LR_WARMUP_STEPS" \
+  --lr_min_ratio "$LR_MIN_RATIO"
 
 # Copy the produced checkpoints into OUTDIR with a clear prefix
 shopt -s nullglob

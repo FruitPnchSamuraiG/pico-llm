@@ -22,6 +22,13 @@ LR=${LR:-2e-4}
 VAL_SPLIT=${VAL_SPLIT:-0.05}
 BLOCK_SIZE=${BLOCK_SIZE:-256}
 
+# Faster training knobs (override via env vars)
+SAMPLE_INTERVAL_SECONDS=${SAMPLE_INTERVAL_SECONDS:-300}
+SAMPLE_EVERY_STEPS=${SAMPLE_EVERY_STEPS:-0}
+LR_SCHEDULE=${LR_SCHEDULE:-cosine}
+LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-200}
+LR_MIN_RATIO=${LR_MIN_RATIO:-0.1}
+
 PROMPT=${PROMPT:-"Once upon a time"}
 
 echo "=========================================="
@@ -30,6 +37,8 @@ echo "Device: $DEVICE"
 echo "transformer_size=$TRANSFORMER_SIZE tinystories_subset=$TINYSTORIES_SUBSET"
 echo "batch=$BATCH epochs=$EPOCHS max_steps_per_epoch=$MAX_STEPS lr=$LR"
 echo "val_split=$VAL_SPLIT"
+echo "sample_interval_seconds=$SAMPLE_INTERVAL_SECONDS sample_every_steps=$SAMPLE_EVERY_STEPS"
+echo "lr_schedule=$LR_SCHEDULE lr_warmup_steps=$LR_WARMUP_STEPS lr_min_ratio=$LR_MIN_RATIO"
 echo "outdir=$OUTDIR"
 echo "=========================================="
 
@@ -43,6 +52,11 @@ python pico-llm.py \
   --block_size "$BLOCK_SIZE" \
   --learning_rate "$LR" \
   --val_split "$VAL_SPLIT" \
-  --prompt "$PROMPT"
+  --prompt "$PROMPT" \
+  --sample_interval_seconds "$SAMPLE_INTERVAL_SECONDS" \
+  --sample_every_steps "$SAMPLE_EVERY_STEPS" \
+  --lr_schedule "$LR_SCHEDULE" \
+  --lr_warmup_steps "$LR_WARMUP_STEPS" \
+  --lr_min_ratio "$LR_MIN_RATIO"
 
 echo "\n✅ Done. Checkpoints: $OUTDIR/transformer_epoch*.pt"

@@ -114,6 +114,41 @@ def parse_args():
         help="Optional path to a .pt state_dict to initialize the Transformer from (for finetuning).",
     )
 
+    # Training / speed knobs
+    parser.add_argument(
+        "--sample_interval_seconds",
+        type=int,
+        default=120,
+        help="Generate sample text every N seconds during training (default: 120). Increase for faster training.",
+    )
+    parser.add_argument(
+        "--sample_every_steps",
+        type=int,
+        default=0,
+        help="If >0, generate sample text every N training steps (overrides --sample_interval_seconds).",
+    )
+
+    # Dynamic LR scheduling
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="cosine",
+        choices=["none", "cosine", "linear"],
+        help="Learning-rate schedule for faster training: none|cosine|linear (default: cosine).",
+    )
+    parser.add_argument(
+        "--lr_warmup_steps",
+        type=int,
+        default=200,
+        help="Warmup steps for LR schedule (default: 200).",
+    )
+    parser.add_argument(
+        "--lr_min_ratio",
+        type=float,
+        default=0.1,
+        help="Min LR as a fraction of base LR for cosine/linear decay (default: 0.1).",
+    )
+
     args = parser.parse_args()
 
     # Apply transformer size preset (only affects transformer hyperparams)
@@ -799,7 +834,11 @@ def train_one_model(model,
                     grad_clip=1.0,
                     weight_decay=0.01,
                     val_loader=None,
-                    checkpoint_dir: str = "."):
+                    checkpoint_dir: str = ".",
+                    lr_schedule: str = "none",
+                    lr_warmup_steps: int = 200,
+                    lr_min_ratio: float = 0.1,
+                    sample_every_steps: int = 0):
     """
     Train a single model (LSTM, Transformer, or K-gram MLP) on the provided data.
     
@@ -820,6 +859,10 @@ def train_one_model(model,
         weight_decay: L2 regularization strength (AdamW)
         val_loader: Optional validation DataLoader
         checkpoint_dir: Directory to save checkpoints and loss histories
+        lr_schedule: Learning-rate schedule for faster training: none|cosine|linear
+        lr_warmup_steps: Warmup steps for LR schedule
+        lr_min_ratio: Min LR as a fraction of base LR for cosine/linear decay
+        sample_every_steps: If >0, generate sample text every N training steps (overrides --sample_interval_seconds)
     
     Returns:
         (train_loss_history, val_loss_history): Tuples of (global_step, loss) for plotting
@@ -840,6 +883,36 @@ def train_one_model(model,
     else:
         # Use AdamW optimizer
         optimizer = optim.AdamW(model.parameters(), lr=lr)
+
+    # ===== LR scheduler (for AdamW runs) =====
+    # Note: the existing --warmup flag uses SGD (optionally with warmup). We keep that behavior.
+    # For AdamW (default), we add an optional warmup+decay schedule.
+    total_steps = None
+    if max_steps_per_epoch is not None:
+        total_steps = epochs * max_steps_per_epoch
+    else:
+        total_steps = epochs * len(loader)
+
+    lr_sched = None
+    if warmup not in ['yes', 'no'] and lr_schedule != "none":
+        def lr_lambda(step: int) -> float:
+            # warmup
+            if lr_warmup_steps > 0 and step < lr_warmup_steps:
+                return float(step) / float(max(1, lr_warmup_steps))
+
+            # decay starts after warmup
+            t = max(0, step - lr_warmup_steps)
+            T = max(1, total_steps - lr_warmup_steps)
+            progress = min(1.0, float(t) / float(T))
+
+            min_lr = max(0.0, min(1.0, lr_min_ratio))
+
+            if lr_schedule == "linear":
+                return (1.0 - progress) * (1.0 - min_lr) + min_lr
+            # cosine
+            return min_lr + 0.5 * (1.0 - min_lr) * (1.0 + math.cos(math.pi * progress))
+
+        lr_sched = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # Track timing for periodic text generation
     start_time = time.time()
@@ -877,8 +950,10 @@ def train_one_model(model,
             
             # Update model parameters
             optimizer.step()
-            if warmup=='yes':
+            if warmup == 'yes':
                 scheduler.step()
+            elif lr_sched is not None:
+                lr_sched.step()
 
             # Track loss statistics
             total_loss += loss.item()
@@ -899,9 +974,17 @@ def train_one_model(model,
                 partial_count = 0
 
             # Generate text samples periodically to monitor quality
-            current_time = time.time()
-            if current_time >= next_sample_time and enc is not None:
-                with torch.no_grad():  # Disable gradients for faster generation
+            do_sample = False
+            if enc is not None:
+                if sample_every_steps and (global_step % sample_every_steps == 0):
+                    do_sample = True
+                else:
+                    current_time = time.time()
+                    if current_time >= next_sample_time:
+                        do_sample = True
+            
+            if do_sample and enc is not None:
+                with torch.no_grad():
                     # Generate using greedy decoding (always pick most likely token)
                     print(f"\n[{model_name}] Generating sample text (greedy) at epoch={epoch}, step={batch_idx}...")
                     text_greedy, ann_greedy = generate_text(
@@ -935,8 +1018,9 @@ def train_one_model(model,
                     print(f" Top-p (p=1.0) Sample: {text_topp1}")
                     print(f" Annotated: {ann_topp1}\n")
 
-                # Schedule next sampling time
-                next_sample_time = current_time + sample_interval
+                # Schedule next sampling time (time-based mode)
+                if not sample_every_steps:
+                    next_sample_time = time.time() + sample_interval
 
             # Early stopping if max steps reached (useful for quick testing)
             if max_steps_per_epoch is not None and step_in_epoch >= max_steps_per_epoch:
@@ -1001,7 +1085,8 @@ def main():
     block_size = args.block_size  # Maximum sequence length
     train_subset_size = args.tinystories_train_subset_size
     log_interval_steps = 100  # Print loss every N steps
-    sample_interval_seconds = 30 # Generate text every N seconds
+    sample_interval_seconds = args.sample_interval_seconds
+    sample_every_steps = args.sample_every_steps
 
     max_steps_per_epoch = args.max_steps_per_epoch  # Optional cap on training steps
     num_inner_layers = args.num_inner_mlp_layers  # Depth of k-gram MLP
@@ -1181,11 +1266,15 @@ def main():
             warmup=warmup,
             log_steps=log_interval_steps,
             sample_interval=sample_interval_seconds,
+            sample_every_steps=sample_every_steps,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
             prompt=args.prompt,
             val_loader=val_loader,
             checkpoint_dir=checkpoint_dir,
+            lr_schedule=args.lr_schedule,
+            lr_warmup_steps=args.lr_warmup_steps,
+            lr_min_ratio=args.lr_min_ratio,
         )
         
         # Store loss histories (both train and val)
