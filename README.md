@@ -74,7 +74,7 @@ flowchart TD
   class CURR,TFULL,CURRSTART,CURRCKPT recommended
   class TFAST,GSM warning
   
-  linkStyle default stroke:#333,stroke-width:2px
+  linkStyle default stroke:#666,stroke-width:2.5px
 ```
 
 ## Environment / constraints
