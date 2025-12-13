@@ -124,19 +124,183 @@ Then pick the candidate with the best score.
 
 ## Interpretability & Analysis
 
-### Attention Head Visualization
+This repo includes comprehensive interpretability tools inspired by Anthropic's mechanistic interpretability research. These techniques help understand what your trained models have learned and how they make decisions.
 
-Visualize what Transformer attention heads are learning by saving heatmaps for any prompt:
+### Background: Anthropic's Interpretability Research
+
+Our interpretability suite draws inspiration from cutting-edge research:
+
+- **[Towards Monosemanticity](https://transformer-circuits.pub/2023/monosemantic-features/index.html)**: Decomposing neural networks into interpretable features using sparse autoencoders
+- **[A Mathematical Framework for Transformer Circuits](https://transformer-circuits.pub/2021/framework/index.html)**: Understanding attention head roles and residual stream composition
+- **[In-context Learning and Induction Heads](https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html)**: How transformers perform in-context learning through specialized attention patterns
+- **[Toy Models of Superposition](https://transformer-circuits.pub/2022/toy_model/index.html)**: Understanding how models represent more features than dimensions
+
+### Available Interpretability Analyses
+
+#### 1. Attention Pattern Analysis 🔍
+
+Visualize what each attention head focuses on across all layers.
+
+**Example Usage:**
+```bash
+python scripts/interpret_transformer.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
+  --analysis attention \
+  --out_dir interpretability_results \
+  --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 \
+  --test_prompts "Once upon a time" "What is 2 + 2?" \
+  --device cuda:0
+```
+
+**What it reveals:**
+- Position-based attention patterns (e.g., attending to previous token, first token)
+- Content-based patterns (e.g., attending to similar words, syntactic structures)
+- Specialized head behaviors (e.g., induction heads for copying patterns)
+
+**Output:** PNG heatmaps in `interpretability_results/attention/` showing attention weights for each head
+
+#### 2. Logit Lens Analysis 🔬
+
+Decode hidden states at each layer to see how predictions evolve through the network.
+
+**Example Usage:**
+```bash
+python scripts/interpret_transformer.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
+  --analysis logit_lens \
+  --out_dir interpretability_results \
+  --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 \
+  --test_prompts "The capital of France is" "2 + 2 =" \
+  --device cuda:0
+```
+
+**What it reveals:**
+- Which layers contribute most to final predictions
+- How token representations refine through depth
+- Early vs. late feature formation
+
+**Output:** JSON file in `interpretability_results/logit_lens/results.json` with layer-by-layer predictions
+
+#### 3. Neuron Activation Analysis 🧠
+
+Find max-activating examples for individual feedforward neurons to discover what features they detect.
+
+**Example Usage:**
+```bash
+python scripts/interpret_transformer.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
+  --analysis neurons \
+  --out_dir interpretability_results \
+  --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 \
+  --neuron_top_k 10 \
+  --test_prompts "Once upon a time there was a princess" "The scientist discovered" \
+  --device cuda:0
+```
+
+**What it reveals:**
+- Monosemantic neurons (respond to single interpretable feature)
+- Polysemantic neurons (respond to multiple unrelated features)
+- Layer-wise specialization (early layers: syntax, late layers: semantics)
+
+**Output:** JSON file in `interpretability_results/neurons/top_neurons.json` with top-K neurons per layer and their max-activating contexts
+
+#### 4. Activation Patching (Causal Analysis) ⚙️
+
+Test causal importance of model components by selectively disabling them.
+
+**Example Usage:**
+```bash
+python scripts/interpret_transformer.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
+  --analysis activation_patch \
+  --out_dir interpretability_results \
+  --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 \
+  --test_prompts "Once upon a time" \
+  --device cuda:0
+```
+
+**What it reveals:**
+- Which attention heads are critical for specific behaviors
+- Redundancy vs. specialization across layers
+- Component-level causal attribution
+
+**Output:** JSON file in `interpretability_results/patching/results.json` (Note: full implementation requires forward hooks)
+
+#### 5. Run All Analyses at Once 🚀
+
+```bash
+python scripts/interpret_transformer.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
+  --analysis attention,logit_lens,neurons \
+  --out_dir interpretability_results \
+  --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 \
+  --test_prompts "Once upon a time" "The cat sat on" "What is" \
+  --neuron_top_k 10 \
+  --device cuda:0
+```
+
+### Model Size Presets
+
+For convenience, match your checkpoint's architecture:
+
+**Small model** (384 embed, 4 heads, 3 blocks, ff_mult=2):
+```bash
+--embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2
+```
+
+**Medium model** (512 embed, 8 heads, 6 blocks, ff_mult=4):
+```bash
+--embed_size 512 --transformer_heads 8 --transformer_blocks 6 --ff_mult 4
+```
+
+### Quick Attention Visualization During Training
+
+For real-time monitoring, save attention heatmaps during training:
 
 ```bash
 python3 pico-llm.py \
   --enable_transformer --disable_lstm \
-  --device_id cpu \
-  --tinystories_weight 0.0 --input_files 3seqs.txt \
-  --block_size 128 --batch_size 4 --num_epochs 1 --max_steps_per_epoch 2 \
-  --save_attention_for_prompt --attention_outdir attn_plots_pos \
+  --device_id cuda:0 \
+  --tinystories_weight 1.0 \
+  --transformer_size small \
+  --block_size 256 --batch_size 16 --num_epochs 1 \
+  --save_attention_for_prompt --attention_outdir attn_plots \
   --prompt "Once upon a time"
 ```
+
+**Output:** PNG files in `attn_plots/` showing attention patterns for the given prompt
+
+### Interpreting Results
+
+**Attention Patterns:**
+- Diagonal patterns → attending to adjacent tokens (local syntax)
+- Vertical bands → attending to specific positions (e.g., first token, delimiters)
+- Sparse patterns → selective attention (content-based)
+- Uniform patterns → broadcasting information equally
+
+**Logit Lens:**
+- Early convergence → shallow features sufficient for task
+- Late refinement → complex reasoning happens in final layers
+- Layer jumps → sudden insight at specific depth
+
+**Neuron Analysis:**
+- High activation concentration → monosemantic (interpretable)
+- Diverse activation contexts → polysemantic (distributed representation)
+- Layer trends → syntax → semantics → task-specific
+
+### Tips for Interpretability Analysis
+
+1. **Use diverse prompts**: Test multiple domains (narrative, factual, arithmetic) to find specialized behaviors
+2. **Compare layers**: Look for specialization patterns across depth
+3. **Iterate on training**: Run interpretability after each epoch to track learning dynamics
+4. **Cross-reference**: Combine attention + neuron analysis to understand full circuits
+5. **Minimal examples**: Use short, clear prompts (3-10 tokens) for clearer patterns
+
+### Further Reading
+
+- **Anthropic's Interpretability Research**: https://transformer-circuits.pub/
+- **Distill.pub Articles**: https://distill.pub/
+- **Neel Nanda's TransformerLens**: https://github.com/neelnanda-io/TransformerLens
 
 ## Requirements
 - Python 3.8+
