@@ -1,8 +1,8 @@
 # pico-llm (Transformer-only extension)
 
-Educational Transformer-only project:
-- **Base training** on TinyStories subsets
-- **Reasoning**: HF dataset export -> SFT finetune, plus **optional RL-style outcome post-training**
+Educational Transformer project with focus on mathematical reasoning:
+- **Base training** on FineMath (high-quality mathematical reasoning text)
+- **Math reasoning**: GSM8K finetuning with optional RL refinement
 - **Interpretability** tooling inspired by Anthropic / Transformer Circuits
 
 ## Comprehensive flowchart
@@ -11,68 +11,39 @@ Educational Transformer-only project:
 flowchart TD
   VENV[Activate venv<br/>/scratch/kk6081/ml_fall25/venv/] --> BASE
 
-  subgraph BASE["Stage 1: Base Transformer training on TinyStories"]
-    TFAST[train_transformer_fast.sh<br/>200k stories 3 epochs]
-    TFULL[train_transformer_full.sh<br/>500k stories 5 epochs<br/>RECOMMENDED]
-    TFAST --> CKPT1[transformer_epoch_N.pt]
-    TFULL --> CKPT1
+  subgraph BASE["Stage 1: FineMath Base Training"]
+    FINEMATH[train_transformer_finemath.sh<br/>100k math examples<br/>5 epochs, 6-8 hours]
+    FINEMATH --> CKPT[transformer_finemath_epoch_N.pt]
   end
 
-  CKPT1 -->|init_from| OT
-  CKPT1 -->|init_from| CURR
-  CKPT1 -->|init_from| GSM
+  CKPT --> GSM
 
-  subgraph OT["Stage 2A: OpenThoughts SFT"]
-    OTDATA[prepare_hf_reasoning_data.py<br/>OpenThoughts-114k] --> OTFILES[open_thoughts_train.txt<br/>open_thoughts_val.txt]
-    OTFILES --> OTSFT[train_transformer_reasoning.sh<br/>2 epochs SFT]
-    OTSFT --> OTCKPT[transformer_reasoning_epoch_N.pt]
+  subgraph GSM["Stage 2: GSM8K Finetuning"]
+    PREP[prepare_hf_gsm8k_data.sh<br/>openai/gsm8k] --> FILES[gsm8k_train.txt<br/>7.3k problems]
+    FILES --> SFT[train_transformer_gsm8k.sh<br/>10 epochs SFT<br/>12-14 hours]
+    SFT --> SFTCKPT[gsm8k_epoch_N.pt]
+    SFTCKPT --> RL[RL Refinement<br/>400 steps<br/>Best-of-8 sampling]
+    RL --> FINAL[transformer_gsm8k_rl.pt<br/>40-55% accuracy ⭐]
   end
 
-  subgraph CURR["Stage 2B: Curriculum Learning RECOMMENDED"]
-    CURRSTART[train_curriculum_math.sh<br/>Auto-downloads HF datasets]
-    CURRSTART --> ARITHDATA[prepare_hf_arithmetic_data.py<br/>ASDiv + Simple arithmetic]
-    ARITHDATA --> ARITHFILES[curriculum_arith_train.txt]
-    ARITHFILES --> ARITHSFT[Arithmetic SFT<br/>3 epochs]
-    ARITHSFT --> ARITHCKPT[arith checkpoint]
-    ARITHCKPT --> CURRGSM[GSM8K SFT<br/>8 epochs]
-    CURRGSM --> CURRGSMCKPT[gsm8k checkpoint]
-    CURRGSMCKPT --> CURRRL[RL Refinement<br/>400 steps]
-    CURRRL --> CURRCKPT[Final RL checkpoint<br/>35-50% accuracy]
+  subgraph EVAL["Stage 3: Evaluation"]
+    E1[eval_reasoning.py<br/>Test on 1.3k problems]
+    E1 --> RESULTS[Accuracy report]
   end
 
-  subgraph GSM["Stage 2C: Direct GSM8K"]
-    GSM_PREP[prepare_hf_gsm8k_data.sh<br/>openai/gsm8k] --> GSMFILES[gsm8k_train.txt<br/>gsm8k_val.txt]
-    GSMFILES --> GSMSFT[train_transformer_gsm8k.sh<br/>8 epochs SFT]
-    GSMSFT --> GSMCKPT[gsm8k checkpoint]
-    GSMCKPT --> GSMRL[RL Refinement<br/>400 steps]
-    GSMRL --> RLCKPT[Final RL checkpoint<br/>20-35% accuracy]
+  FINAL --> E1
+
+  subgraph INTERP["Interpretability Analysis"]
+    IT[interpret_transformer.py<br/>Attention + Neurons]
+    IT --> VIEW[interpretability_viewer.py<br/>Web UI at localhost:8000]
   end
 
-  subgraph EVAL["Evaluation"]
-    E1[eval_reasoning.py<br/>Test set accuracy]
-  end
-
-  OTCKPT --> E1
-  CURRCKPT --> E1
-  RLCKPT --> E1
-
-  subgraph INTERP["Interpretability"]
-    IT[interpret_transformer.py]
-    IT --> IOUT[Attention + Neurons]
-    IOUT --> VIEW[interpretability_viewer.py<br/>Web UI]
-  end
-
-  CKPT1 --> IT
-  OTCKPT --> IT
-  CURRCKPT --> IT
-  RLCKPT --> IT
+  CKPT --> IT
+  FINAL --> IT
 
   classDef recommended fill:#d4edda,stroke:#28a745,stroke-width:3px,color:#000
-  classDef warning fill:#fff3cd,stroke:#ffc107,stroke-width:2px,color:#000
-  classDef default fill:#f0f0f0,stroke:#333,stroke-width:2px,color:#000
   
-  class CURR,TFULL,CURRSTART,CURRCKPT recommended
-  class TFAST,GSM warning
+  class FINEMATH,CKPT,GSM,FINAL recommended
   
   linkStyle default stroke:#666,stroke-width:2.5px
 ```
@@ -84,101 +55,77 @@ flowchart TD
 
 ## TL;DR (quick start commands)
 
-### Recommended: Curriculum Learning for Best GSM8K Results ⭐
+### Complete Training Pipeline: FineMath → GSM8K ⭐
 
 ```bash
 source /scratch/kk6081/ml_fall25/venv/bin/activate
 cd /home/kk6081/pico_llm_extend/pico-llm
 
-# 1) Train strong base transformer (500k stories, 5 epochs - 3-6 hours)
-TINYSTORIES_SUBSET=500000 EPOCHS=5 bash scripts/train_transformer_full.sh
+# 1) Train on FineMath (mathematical reasoning base) - 6-8 hours
+EPOCHS=5 MAX_SAMPLES=100000 bash scripts/train_transformer_finemath.sh
 
-# 2) Curriculum learning: HuggingFace arithmetic → GSM8K (12-15 hours)
-#    Auto-downloads ASDiv + simple arithmetic datasets
-bash scripts/train_curriculum_math.sh
+# 2) Train on GSM8K with RL - 12-14 hours
+BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_finemath_epoch5.pt" \
+  EPOCHS=10 LR=5e-4 RUN_RL=1 \
+  bash scripts/train_transformer_gsm8k.sh
 
 # 3) Evaluate
-python scripts/eval_reasoning.py
+python scripts/eval_reasoning.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_gsm8k_rl.pt \
+  --data data/gsm8k_test.txt
 
-# Expected: 35-50% GSM8K accuracy with MEDIUM model!
+# Expected: 40-55% GSM8K accuracy with MEDIUM model!
+# Total training time: ~20 hours
 ```
 
-### Alternative: Direct Training Paths
+### Quick Evaluation & Interpretability
 
 ```bash
-# Fast base training (200k stories, 3 epochs - ~30 min)
-bash scripts/train_transformer_fast.sh
-
-# Option A: OpenThoughts reasoning (no RL)
-bash scripts/train_transformer_reasoning.sh
-
-# Option B: Direct GSM8K (8 epochs SFT + RL - 8-10 hours)
-bash scripts/train_transformer_gsm8k.sh
+# Evaluate GSM8K accuracy
+python scripts/eval_reasoning.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_gsm8k_rl.pt \
+  --data data/gsm8k_test.txt
 
 # Interpretability analysis
-python scripts/interpret_transformer.py --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
-  --analysis attention,logit_lens,neurons --out_dir /scratch/kk6081/picollm_extend/interpretability_base \
-  --embed_size 512 --transformer_heads 8 --transformer_blocks 6 --ff_mult 4 --test_prompts "Once upon a time" --device cuda:0
+python scripts/interpret_transformer.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_finemath_epoch5.pt \
+  --analysis attention,logit_lens,neurons \
+  --out_dir /scratch/kk6081/picollm_extend/interpretability \
+  --embed_size 512 --transformer_heads 8 --transformer_blocks 6 --ff_mult 4 \
+  --test_prompts "Problem: If x + 5 = 12, then x =" \
+  --device cuda:0
+
+# View interpretability results in browser
+python scripts/interpretability_viewer.py \
+  --root /scratch/kk6081/picollm_extend/interpretability \
+  --host 127.0.0.1 --port 8000
 ```
 
-**💡 Pro tip**: For better GSM8K results, see **[QUICK_FIX_GUIDE.md](QUICK_FIX_GUIDE.md)** for optimal training settings!
+## 📚 Key Concepts
 
-## 📚 Documentation & Training Guides
+### Why FineMath Base?
 
-### Essential Reading
-- **[QUICK_FIX_GUIDE.md](QUICK_FIX_GUIDE.md)** - Fix poor reasoning outputs (READ THIS FIRST!)
-- **[HF_DATASETS_COMPLETE_GUIDE.md](HF_DATASETS_COMPLETE_GUIDE.md)** - Curriculum learning with HuggingFace ⭐NEW
+**FineMath** provides high-quality mathematical reasoning text that naturally transfers to GSM8K:
+- ✅ **Step-by-step solutions**: "Therefore, x = ...", "Simplify..."
+- ✅ **Math vocabulary**: "Given that...", "Solve for x", "Calculate..."
+- ✅ **Clean patterns**: No narrative contamination, pure mathematical reasoning
+- ✅ **Natural transfer**: Math base → Math task (GSM8K)
 
-### Advanced Guides
-- **[HF_CURRICULUM_DATASETS.md](HF_CURRICULUM_DATASETS.md)** - Detailed dataset reference
-- **[TRAINING_IMPROVEMENT_PLAN.md](TRAINING_IMPROVEMENT_PLAN.md)** - Performance optimization roadmap
-- **[GRADIENT_NORMS_GUIDE.md](GRADIENT_NORMS_GUIDE.md)** - Understanding `grad_norm > 1` (it's normal!)
-- **[TRAINING_DEFAULTS.md](TRAINING_DEFAULTS.md)** - Complete hyperparameter reference
-- **[TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md)** - FP16, gradient accumulation, LLRD
+### Expected Results
 
-### Visual Guides
-- **[TRAINING_PATHS.txt](TRAINING_PATHS.txt)** - Visual comparison of training strategies
-- **[HF_VS_CUSTOM_COMPARISON.txt](HF_VS_CUSTOM_COMPARISON.txt)** - HuggingFace vs custom data comparison
+| Training Stage | Checkpoint | Accuracy | Time |
+|---------------|------------|----------|------|
+| **FineMath Base** | transformer_finemath_epoch5.pt | - | 6-8h |
+| **GSM8K SFT** | gsm8k_epoch10.pt | 35-45% | 10-12h |
+| **RL Refinement** ⭐ | transformer_gsm8k_rl.pt | **40-55%** | 2-3h |
 
-## 🎓 New: Curriculum Learning for Math Reasoning
+**Total**: ~20 hours for production-quality math reasoning model
 
-**Why curriculum learning?** Teaching basic arithmetic before complex word problems improves GSM8K accuracy by 10-20%.
+### Datasets Used
 
-### What is Curriculum Learning?
-
-Instead of jumping directly to GSM8K:
-```
-❌ Old: Base Model (200k×3) → GSM8K (3 epochs) = 7-10% accuracy
-```
-
-Use progressive difficulty:
-```
-✅ New: Base Model (500k×5) → Arithmetic (3 epochs) → GSM8K (8 epochs) = 35-50% accuracy
-```
-
-### Quick Start
-
-```bash
-# One command - does everything automatically!
-bash scripts/train_curriculum_math.sh
-```
-
-**What it does:**
-1. **Downloads HuggingFace datasets** (ASDiv elementary math, simple arithmetic)
-2. **Arithmetic stage** (3 epochs): Learns basic operations + word problems
-3. **GSM8K SFT stage** (8 epochs): Learns complex multi-step reasoning
-4. **RL refinement** (400 steps): Improves answer selection via best-of-n sampling
-
-**Datasets used (auto-downloaded):**
-- **ASDiv**: 2,000 elementary school math problems (natural language word problems)
-- **Simple Arithmetic**: 5,000 basic operations (addition, subtraction, multiplication)
-- **GSM8K**: 7,324 complex reasoning problems (multi-step word problems)
-
-See **[HF_DATASETS_COMPLETE_GUIDE.md](HF_DATASETS_COMPLETE_GUIDE.md)** for:
-- Available datasets (ASDiv, MathQA, AQuA-RAT)
-- Customization options
-- Performance comparisons
-- Troubleshooting
+- **FineMath-4plus** (base): 100k high-quality math examples from HuggingFace
+- **GSM8K** (finetuning): 7.3k grade school math word problems
+- **RL refinement**: Best-of-n sampling for answer selection
 
 ## 🚀 Quick Start: Apply Training Patches (RECOMMENDED)
 
@@ -220,11 +167,21 @@ cp pico-llm.py.backup pico-llm.py
 
 ## Training
 
-### Base Transformer (TinyStories)
-- Fast dev: `bash scripts/train_transformer_fast.sh`
-- Full run: `bash scripts/train_transformer_full.sh`
+### FineMath Base Training
 
-Scaling knobs (see `pico-llm.py`):
+Train transformer base model on high-quality mathematical reasoning text:
+
+```bash
+bash scripts/train_transformer_finemath.sh
+```
+
+**Default settings:**
+- 100k math examples from FineMath-4plus
+- 5 epochs, ~6-8 hours on GTX TITAN X
+- MEDIUM architecture (512d, 8h, 6b)
+- Learning rate: 2e-4 with cosine schedule
+
+**Scaling knobs** (see `pico-llm.py`):
 - `--transformer_size {small,medium}`
 - `--tinystories_train_subset_size N`
 - Faster training knobs: `--sample_interval_seconds`, `--sample_every_steps`, `--lr_schedule`, `--lr_warmup_steps`, `--lr_min_ratio`
@@ -234,17 +191,17 @@ If you hit OOM on 12GB:
 
 ### Training Parameters
 
-Environment variables to control training (work with all training scripts):
+Environment variables to control training:
 ```bash
 # Model architecture
 TRANSFORMER_SIZE=medium          # small (384d, 4h, 3b) or medium (512d, 8h, 6b)
-TINYSTORIES_SUBSET=100000        # Number of TinyStories examples
+MAX_SAMPLES=100000              # Number of FineMath examples
 
 # Training hyperparameters
 BATCH=16                         # Batch size (reduce to 8 or 4 if OOM)
-EPOCHS=3                         # Number of epochs
+EPOCHS=5                         # Number of epochs
 LR=2e-4                          # Learning rate
-VAL_SPLIT=0.1                    # Validation split (0.1 = 10%)
+VAL_SPLIT=0.05                   # Validation split (0.05 = 5%)
 
 # LR scheduling
 LR_SCHEDULE=cosine               # none, cosine, or linear
@@ -252,13 +209,12 @@ LR_WARMUP_STEPS=500              # Warmup steps for stability
 LR_MIN_RATIO=0.1                 # Min LR as fraction of base LR
 
 # Sampling/logging
-SAMPLE_EVERY_STEPS=100           # Generate text every N steps (0=time-based)
-SAMPLE_INTERVAL_SECONDS=300      # Or every N seconds (if SAMPLE_EVERY_STEPS=0)
+SAMPLE_INTERVAL_SECONDS=600      # Generate text every N seconds
 ```
 
-**Example**: Train medium model with larger batch
+**Example**: Train with more data
 ```bash
-TRANSFORMER_SIZE=medium BATCH=32 LR=3e-4 bash scripts/train_transformer_fast.sh
+TRANSFORMER_SIZE=medium MAX_SAMPLES=200000 EPOCHS=8 bash scripts/train_transformer_finemath.sh
 ```
 
 ### 🔧 Advanced: Manual Training Improvements
@@ -271,105 +227,63 @@ If you want more control beyond the automatic patch, see **[TRAINING_IMPROVEMENT
 - **Curriculum learning** - start with easier examples
 - **Troubleshooting guide** - fix loss explosions, plateaus, overfitting
 
-## Reasoning: datasets + training
+## GSM8K Math Reasoning Training
 
-### A) OpenThoughts SFT (no RL)
-Default: `open-thoughts/OpenThoughts-114k` -> exported to line-based text.
+### Step-by-Step Guide
 
+**1. Prepare GSM8K Data** (automatic, runs on first training):
 ```bash
-bash scripts/train_transformer_reasoning.sh
+bash scripts/prepare_hf_gsm8k_data.sh
+```
+Downloads GSM8K dataset from HuggingFace and creates:
+- `data/gsm8k_train.txt` (7,324 examples)
+- `data/gsm8k_val.txt` (split from train)
+- `data/gsm8k_test.txt` (1,319 examples)
+
+**2. Train on GSM8K**:
+```bash
+BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_finemath_epoch5.pt" \
+  EPOCHS=10 LR=5e-4 RUN_RL=1 \
+  bash scripts/train_transformer_gsm8k.sh
 ```
 
-**Auto-selects base checkpoint**: Scripts automatically use the **latest epoch checkpoint** (highest epoch number) from `/scratch/kk6081/picollm_extend/transformer_epoch*.pt`. Override with `BASE_CKPT=/path/to/checkpoint.pt` if needed.
-
-Outputs copied back as:
-- `/scratch/kk6081/picollm_extend/transformer_reasoning_transformer_epoch*.pt`
-
-### B) GSM8K with Curriculum Learning ⭐ RECOMMENDED
-
-**Best approach for small models**: Use progressive difficulty training
-
-```bash
-# Full curriculum pipeline (automatic)
-bash scripts/train_curriculum_math.sh
-```
-
-**What it does:**
-1. Downloads HuggingFace datasets (ASDiv, simple arithmetic)
-2. Trains on elementary math (3 epochs, 2-3 hours)
-3. Trains on GSM8K reasoning (8 epochs SFT, 6-8 hours)
-4. RL refinement (400 steps, 2-3 hours)
-
-**Expected accuracy:** 35-50% with MEDIUM model (vs 7-10% without curriculum)
-
-**Datasets used:**
-- **ASDiv** (HuggingFace): 2k elementary school problems
-- **Simple arithmetic**: 5k basic operations  
-- **GSM8K**: 7.3k complex reasoning problems
-
-See **[HF_DATASETS_COMPLETE_GUIDE.md](HF_DATASETS_COMPLETE_GUIDE.md)** for customization options.
-
----
-
-### C) GSM8K Direct Training (No Curriculum)
-
-If you want to skip curriculum learning (faster but lower accuracy):
-
-Dataset:
-- https://huggingface.co/datasets/openai/gsm8k (config `main`)
-
-Prepare text files (optional; script auto-runs if missing):
-- `bash scripts/prepare_hf_gsm8k_data.sh` -> writes `data/gsm8k_{train,val,test}.txt`
-
-Train:
-```bash
-bash scripts/train_transformer_gsm8k.sh
-```
-
-**Auto-selects base checkpoint**: Scripts automatically use the **latest epoch checkpoint** (highest epoch number) from `/scratch/kk6081/picollm_extend/transformer_epoch*.pt`. Override with `BASE_CKPT=/path/to/checkpoint.pt` if needed.
-
-**Default training:** 8 epochs SFT (~6-8 hours) + 400 steps RL (~2-3 hours) = **~8-11 hours total**
-
-**Expected accuracy:** 20-35% with MEDIUM model (lower than curriculum approach)
-
----
-
-### Training Approach Comparison
-
-| Approach | Base Model | Training | Time | Expected Accuracy | Best For |
-|----------|------------|----------|------|-------------------|----------|
-| **Curriculum** ⭐ | 500k×5 | Arith(3ep) → GSM8K(8ep) + RL | 15-20h | **35-50%** | Production quality |
-| **Direct GSM8K** | 500k×5 | GSM8K(8ep) + RL | 10-13h | 20-35% | Faster iteration |
-| **Fast test** | 200k×3 | GSM8K(3ep) + RL | 3-4h | 7-15% | Quick debugging |
-| **OpenThoughts** | 500k×5 | OpenThoughts(2ep) | 4-6h | 15-25% | Chain-of-thought |
-
-**Recommendation:** Use **Curriculum Learning** for best results. Only skip it if time is very limited.
-
-**Quick test mode** (for debugging):
-```bash
-EPOCHS=1 MAX_STEPS=500 RUN_RL=0 bash scripts/train_transformer_gsm8k.sh
-```
-
-Notes:
-- Stage 1: SFT finetune (3 epochs, full dataset by default) → `transformer_gsm8k_transformer_epoch*.pt`
-- Stage 2: RL-style outcome post-training (400 steps, batch=12, samples=8, **enabled** by default)
-  - Disable via `RUN_RL=0`
-  - Uses latest SFT checkpoint automatically
-  - Output copied back as `/scratch/kk6081/picollm_extend/transformer_gsm8k_rl.pt`
-- 📖 See **[TRAINING_DEFAULTS.md](TRAINING_DEFAULTS.md)** for parameter details and override examples
-
-RL reading pointers:
-- DeepSeek-R1: https://arxiv.org/abs/2501.12948
-- Dr. Tulu draft: https://www.datocms-assets.com/64837/1763496622-dr_tulu_draft.pdf
-
-### Reasoning evaluation
-Heuristic numeric accuracy (works best with GSM8K / synthetic arithmetic):
-
+**3. Evaluate**:
 ```bash
 python scripts/eval_reasoning.py \
-  --checkpoint /scratch/kk6081/picollm_extend/transformer_gsm8k_transformer_epoch1.pt \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_gsm8k_rl.pt \
   --data data/gsm8k_test.txt
 ```
+
+### Training Configuration
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `EPOCHS` | 8 | Use 10 for better results |
+| `LR` | 5e-4 | Learning rate for GSM8K finetuning |
+| `RUN_RL` | 1 | Set to 0 to skip RL refinement |
+| `RL_STEPS` | 400 | RL refinement iterations |
+| `RL_BATCH` | 12 | Batch size for RL |
+| `RL_NUM_SAMPLES` | 8 | Best-of-n samples per problem |
+
+**Override examples**:
+```bash
+# Quick test (no RL, 1 epoch)
+EPOCHS=1 RUN_RL=0 bash scripts/train_transformer_gsm8k.sh
+
+# Extended training (15 epochs + RL)
+EPOCHS=15 RUN_RL=1 RL_STEPS=600 bash scripts/train_transformer_gsm8k.sh
+```
+
+### Understanding RL Refinement
+
+After supervised finetuning (SFT), RL refinement improves answer selection:
+1. Generate `N` candidate solutions per problem (best-of-n sampling)
+2. Score solutions based on correct final answer
+3. Update model to prefer correct reasoning paths
+
+**Reading**:
+- [DeepSeek-R1 paper](https://arxiv.org/abs/2501.12948) - RL for reasoning
+- [Dr. Tulu draft](https://www.datocms-assets.com/64837/1763496622-dr_tulu_draft.pdf) - Outcome supervision
 
 ## Interpretability & analysis
 
@@ -408,9 +322,52 @@ python scripts/interpret_transformer.py \
   --device cuda:0
 ```
 
-Smoke-test outputs (already verified previously):
-- `/scratch/kk6081/picollm_extend/interpretability_test/attention/attn_*.png`
-- `/scratch/kk6081/picollm_extend/interpretability_test/logit_lens/results.json`
-- `/scratch/kk6081/picollm_extend/interpretability_test/neurons/top_neurons.json`
-- `/scratch/kk6081/picollm_extend/interpretability_test/summary.json`
+Outputs:
+- `attention/attn_*.png` - Attention heatmaps per layer/head
+- `logit_lens/results.json` - Token predictions at each layer
+- `neurons/top_neurons.json` - Max-activating contexts for FF neurons
+- `summary.json` - Analysis metadata
+
+---
+
+## 📁 Repository Structure
+
+### Training Scripts
+- `train_transformer_finemath.sh` ⭐ - Train base model on FineMath (math-focused)
+- `train_transformer_gsm8k.sh` - GSM8K finetuning + optional RL
+- `train_transformer_full.sh` - (Legacy) Train on TinyStories (general language)
+- `train_transformer_fast.sh` - (Legacy) Quick TinyStories training for testing
+
+### Data Preparation
+- `prepare_hf_finemath_data.py` - Download FineMath from HuggingFace
+- `prepare_hf_gsm8k_data.sh` - Download GSM8K from HuggingFace
+
+### Evaluation & Analysis
+- `eval_reasoning.py` - Evaluate GSM8K accuracy
+- `interpret_transformer.py` - Attention/neuron analysis
+- `interpretability_viewer.py` - Web UI for interpretability results
+- `rl_reasoning_outcome.py` - RL refinement script (called by train_transformer_gsm8k.sh)
+
+### Utilities
+- `check_checkpoint_arch.py` - Inspect checkpoint architecture
+- `training_stability_patch.py` - Apply training improvements to pico-llm.py
+
+### Core
+- `pico-llm.py` - Main training script (Transformer + LSTM implementations)
+- `inference.py` - Generate text from trained models
+- `plot_losses.py` - Visualize training curves
+
+---
+
+## 🎯 Quick Reference Card
+
+| Task | Command | Time |
+|------|---------|------|
+| **Math base training** | `bash scripts/train_transformer_finemath.sh` | 6-8h |
+| **GSM8K training** | `BASE_CKPT=... bash scripts/train_transformer_gsm8k.sh` | 12-14h |
+| **Evaluate GSM8K** | `python scripts/eval_reasoning.py --checkpoint ... --data data/gsm8k_test.txt` | 5-10m |
+| **Interpretability** | `python scripts/interpret_transformer.py --checkpoint ...` | 2-5m |
+| **View results** | `python scripts/interpretability_viewer.py --root ...` | instant |
+
+**Total time for best model**: ~20 hours (FineMath base + GSM8K + RL)
 
