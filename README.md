@@ -81,7 +81,45 @@ python scripts/interpret_transformer.py --checkpoint /scratch/kk6081/picollm_ext
   --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 --test_prompts "Once upon a time" --device cuda:0
 ```
 
-**💡 Pro tip**: Apply training improvements first for 30-50% faster convergence! See: **[QUICKSTART_APPLY_PATCHES.md](QUICKSTART_APPLY_PATCHES.md)**
+**💡 Pro tip**: Apply training improvements first for 30-50% faster convergence!
+
+## 🚀 Quick Start: Apply Training Patches (RECOMMENDED)
+
+**Before your first training run**, apply stability patches for 30-50% faster convergence:
+
+```bash
+# 1. Preview what will be changed (safe, no modifications)
+python scripts/training_stability_patch.py --dry-run
+
+# 2. Apply patches to pico-llm.py (creates backup automatically)
+python scripts/training_stability_patch.py --apply
+
+# 3. Train as normal - patches are now active!
+bash scripts/train_transformer_fast.sh
+```
+
+**What gets patched**:
+- ✅ **GPT-2 style weight initialization** - prevents exploding/vanishing gradients
+- ✅ **Improved AdamW settings** - better convergence (beta2=0.95, weight_decay=0.1)
+- ✅ **Gradient norm monitoring** - detect instability early (logs grad_norm in training)
+- ✅ **Early stopping** - saves best checkpoint, stops if validation loss plateaus
+
+**Verification**: After applying, your training logs will show:
+```
+[transformer] Epoch 1/3, Step 20/200 (global step: 20) Loss: 4.2341, Grad_norm: 2.156, LR: 1.50e-04
+```
+
+If you see `Grad_norm` and `LR` in logs → patches are active! ✅
+
+**Rollback if needed**:
+```bash
+# Restore original (backup created automatically)
+cp pico-llm.py.backup pico-llm.py
+```
+
+📖 **For advanced techniques** (mixed precision, gradient accumulation, LLRD), see: **[TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md)**
+
+---
 
 ## Training
 
@@ -97,33 +135,44 @@ Scaling knobs (see `pico-llm.py`):
 If you hit OOM on 12GB:
 - `BATCH=8` (or `4`) and/or `TRANSFORMER_SIZE=small`
 
-### 🔧 Training Stability & Speed Improvements
-For more stable training and faster convergence, see **[TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md)**
+### Training Parameters
 
-**Quick wins** (highest impact):
-1. ✅ **Proper weight initialization** (GPT-2 style) - prevents exploding/vanishing gradients
-2. ✅ **Gradient accumulation** - bigger effective batch size on limited VRAM
-3. ✅ **Improved AdamW hyperparameters** - better convergence (beta2=0.95, weight_decay=0.1)
-4. ✅ **Gradient norm monitoring** - detect instability early
-5. ✅ **Early stopping** - avoid overfitting
-
-**Apply automatically**:
+Environment variables to control training (work with all training scripts):
 ```bash
-# Preview changes
-python scripts/training_stability_patch.py --dry-run
+# Model architecture
+TRANSFORMER_SIZE=medium          # small (384d, 4h, 3b) or medium (512d, 8h, 6b)
+TINYSTORIES_SUBSET=100000        # Number of TinyStories examples
 
-# Apply patches to pico-llm.py
-python scripts/training_stability_patch.py --apply
+# Training hyperparameters
+BATCH=16                         # Batch size (reduce to 8 or 4 if OOM)
+EPOCHS=3                         # Number of epochs
+LR=2e-4                          # Learning rate
+VAL_SPLIT=0.1                    # Validation split (0.1 = 10%)
+
+# LR scheduling
+LR_SCHEDULE=cosine               # none, cosine, or linear
+LR_WARMUP_STEPS=500              # Warmup steps for stability
+LR_MIN_RATIO=0.1                 # Min LR as fraction of base LR
+
+# Sampling/logging
+SAMPLE_EVERY_STEPS=100           # Generate text every N steps (0=time-based)
+SAMPLE_INTERVAL_SECONDS=300      # Or every N seconds (if SAMPLE_EVERY_STEPS=0)
 ```
 
-Expected improvements: **30-50% faster convergence**, much smoother loss curves.
+**Example**: Train medium model with larger batch
+```bash
+TRANSFORMER_SIZE=medium BATCH=32 LR=3e-4 bash scripts/train_transformer_fast.sh
+```
 
-See [TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md) for:
-- Mixed precision training (FP16)
-- Layer-wise learning rate decay
-- Dropout strategies
-- Curriculum learning
-- Full troubleshooting guide
+### 🔧 Advanced: Manual Training Improvements
+
+If you want more control beyond the automatic patch, see **[TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md)** for:
+- **Gradient accumulation** - simulate larger batch sizes (effective batch = BATCH × ACCUM_STEPS)
+- **Mixed precision training (FP16)** - 2x faster, 50% less memory
+- **Layer-wise learning rate decay (LLRD)** - for finetuning only
+- **Dropout strategies** - prevent overfitting
+- **Curriculum learning** - start with easier examples
+- **Troubleshooting guide** - fix loss explosions, plateaus, overfitting
 
 ## Reasoning: datasets + training
 
