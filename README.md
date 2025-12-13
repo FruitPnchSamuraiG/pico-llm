@@ -124,24 +124,29 @@ Then pick the candidate with the best score.
 
 ## Interpretability & Analysis
 
-This repo includes comprehensive interpretability tools inspired by Anthropic's mechanistic interpretability research. These techniques help understand what your trained models have learned and how they make decisions.
+This repo includes interpretability tooling (`scripts/interpret_transformer.py`) inspired by Anthropic / Transformer Circuits mechanistic interpretability work.
 
-### Background: Anthropic's Interpretability Research
+### Background (and how each analysis maps to the literature)
 
-Our interpretability suite draws inspiration from cutting-edge research:
+Core reading hub:
+- Transformer Circuits (Anthropic): https://transformer-circuits.pub/
 
-- **[Towards Monosemanticity](https://transformer-circuits.pub/2023/monosemantic-features/index.html)**: Decomposing neural networks into interpretable features using sparse autoencoders
-- **[A Mathematical Framework for Transformer Circuits](https://transformer-circuits.pub/2021/framework/index.html)**: Understanding attention head roles and residual stream composition
-- **[In-context Learning and Induction Heads](https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html)**: How transformers perform in-context learning through specialized attention patterns
-- **[Toy Models of Superposition](https://transformer-circuits.pub/2022/toy_model/index.html)**: Understanding how models represent more features than dimensions
+We reference specific posts in the *relevant analysis* below:
+- **Circuit / attention-head thinking**: **[A Mathematical Framework for Transformer Circuits](https://transformer-circuits.pub/2021/framework/index.html)**
+- **Induction heads / copying patterns**: **[In-context Learning and Induction Heads](https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html)**
+- **Feature discovery & monosemanticity** (conceptual inspiration for neuron/feature analysis): **[Towards Monosemanticity](https://transformer-circuits.pub/2023/monosemantic-features/index.html)**
+- **Superposition & polysemanticity** (why neurons can be hard to interpret): **[Toy Models of Superposition](https://transformer-circuits.pub/2022/toy_model/index.html)**
 
-### Available Interpretability Analyses
+### How to run interpretability
 
-#### 1. Attention Pattern Analysis 🔍
+**Important:** `interpret_transformer.py` must be given architecture flags that match the checkpoint.
 
-Visualize what each attention head focuses on across all layers.
+#### Analysis A) Attention Pattern Analysis
 
-**Example Usage:**
+**Related reading:**
+- [A Mathematical Framework for Transformer Circuits](https://transformer-circuits.pub/2021/framework/index.html)
+- [In-context Learning and Induction Heads](https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html)
+
 ```bash
 python scripts/interpret_transformer.py \
   --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
@@ -152,18 +157,15 @@ python scripts/interpret_transformer.py \
   --device cuda:0
 ```
 
-**What it reveals:**
-- Position-based attention patterns (e.g., attending to previous token, first token)
-- Content-based patterns (e.g., attending to similar words, syntactic structures)
-- Specialized head behaviors (e.g., induction heads for copying patterns)
+**Output:** PNG heatmaps in `interpretability_results/attention/`.
 
-**Output:** PNG heatmaps in `interpretability_results/attention/` showing attention weights for each head
+#### Analysis B) Logit Lens (Intermediate Predictions)
 
-#### 2. Logit Lens Analysis 🔬
+This is a simple “decode every layer” diagnostic (not a full circuits method), but it pairs well with the circuit-frame perspective in the Framework post.
 
-Decode hidden states at each layer to see how predictions evolve through the network.
+**Related reading:**
+- [A Mathematical Framework for Transformer Circuits](https://transformer-circuits.pub/2021/framework/index.html)
 
-**Example Usage:**
 ```bash
 python scripts/interpret_transformer.py \
   --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
@@ -174,18 +176,16 @@ python scripts/interpret_transformer.py \
   --device cuda:0
 ```
 
-**What it reveals:**
-- Which layers contribute most to final predictions
-- How token representations refine through depth
-- Early vs. late feature formation
+**Output:** `interpretability_results/logit_lens/results.json`.
 
-**Output:** JSON file in `interpretability_results/logit_lens/results.json` with layer-by-layer predictions
+#### Analysis C) Neuron Activation Analysis (max-activating contexts)
 
-#### 3. Neuron Activation Analysis 🧠
+This is a lightweight starting point for “feature discovery”. In real mechanistic interpretability work, neurons are often *not* monosemantic; the links below explain why and what to do next.
 
-Find max-activating examples for individual feedforward neurons to discover what features they detect.
+**Related reading:**
+- [Towards Monosemanticity](https://transformer-circuits.pub/2023/monosemantic-features/index.html)
+- [Toy Models of Superposition](https://transformer-circuits.pub/2022/toy_model/index.html)
 
-**Example Usage:**
 ```bash
 python scripts/interpret_transformer.py \
   --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
@@ -197,18 +197,15 @@ python scripts/interpret_transformer.py \
   --device cuda:0
 ```
 
-**What it reveals:**
-- Monosemantic neurons (respond to single interpretable feature)
-- Polysemantic neurons (respond to multiple unrelated features)
-- Layer-wise specialization (early layers: syntax, late layers: semantics)
+**Output:** `interpretability_results/neurons/top_neurons.json`.
 
-**Output:** JSON file in `interpretability_results/neurons/top_neurons.json` with top-K neurons per layer and their max-activating contexts
+#### Analysis D) Activation Patching (Causal Analysis) (experimental)
 
-#### 4. Activation Patching (Causal Analysis) ⚙️
+This is a stub/framework for causal interventions; it currently reports structure and writes results, but a full implementation requires forward hooks.
 
-Test causal importance of model components by selectively disabling them.
+**Related reading (conceptual):**
+- [A Mathematical Framework for Transformer Circuits](https://transformer-circuits.pub/2021/framework/index.html)
 
-**Example Usage:**
 ```bash
 python scripts/interpret_transformer.py \
   --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
@@ -219,14 +216,9 @@ python scripts/interpret_transformer.py \
   --device cuda:0
 ```
 
-**What it reveals:**
-- Which attention heads are critical for specific behaviors
-- Redundancy vs. specialization across layers
-- Component-level causal attribution
+**Output:** `interpretability_results/patching/results.json`.
 
-**Output:** JSON file in `interpretability_results/patching/results.json` (Note: full implementation requires forward hooks)
-
-#### 5. Run All Analyses at Once 🚀
+#### Run multiple analyses
 
 ```bash
 python scripts/interpret_transformer.py \
@@ -239,68 +231,120 @@ python scripts/interpret_transformer.py \
   --device cuda:0
 ```
 
-### Model Size Presets
+### Interpretability results (smoke test)
 
-For convenience, match your checkpoint's architecture:
+Verified outputs were generated under:
+- `/scratch/kk6081/picollm_extend/interpretability_test/`
 
-**Small model** (384 embed, 4 heads, 3 blocks, ff_mult=2):
+Files produced:
+- Attention heatmaps (PNGs): `interpretability_test/attention/attn_*.png`
+- Logit lens: `interpretability_test/logit_lens/results.json`
+- Neuron analysis: `interpretability_test/neurons/top_neurons.json`
+- Summary metadata: `interpretability_test/summary.json`
+
+## End-to-end: run the full pipeline (Transformer → reasoning → decoding → interpretability)
+
+### TL;DR (5 commands)
+
+From a clean shell:
+
 ```bash
---embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2
+source /scratch/kk6081/ml_fall25/venv/bin/activate
+cd /home/kk6081/pico_llm_extend/pico-llm
+bash scripts/train_transformer_fast.sh
+bash scripts/train_transformer_reasoning.sh
+python scripts/interpret_transformer.py --checkpoint /scratch/kk6081/picollm_extend/transformer_reasoning_transformer_epoch1.pt --analysis attention,logit_lens,neurons --out_dir /scratch/kk6081/picollm_extend/interpretability_reasoning --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 --test_prompts "What is 2 + 2?" "Once upon a time" --device cuda:0
 ```
 
-**Medium model** (512 embed, 8 heads, 6 blocks, ff_mult=4):
-```bash
---embed_size 512 --transformer_heads 8 --transformer_blocks 6 --ff_mult 4
-```
-
-### Quick Attention Visualization During Training
-
-For real-time monitoring, save attention heatmaps during training:
+(Optionally) evaluate reasoning / run decoding search after finetune:
 
 ```bash
-python3 pico-llm.py \
-  --enable_transformer --disable_lstm \
-  --device_id cuda:0 \
-  --tinystories_weight 1.0 \
-  --transformer_size small \
-  --block_size 256 --batch_size 16 --num_epochs 1 \
-  --save_attention_for_prompt --attention_outdir attn_plots \
-  --prompt "Once upon a time"
+python scripts/eval_reasoning.py --checkpoint /scratch/kk6081/picollm_extend/transformer_reasoning_transformer_epoch1.pt --data data/open_thoughts_val.txt --decode greedy
+python inference.py --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt --prompt "Once upon a time" --decode lookahead --lookahead_k 8 --lookahead_h 6 --device cuda:0
 ```
 
-**Output:** PNG files in `attn_plots/` showing attention patterns for the given prompt
+All commands assume:
 
-### Interpreting Results
+```bash
+source /scratch/kk6081/ml_fall25/venv/bin/activate
+cd /home/kk6081/pico_llm_extend/pico-llm
+```
 
-**Attention Patterns:**
-- Diagonal patterns → attending to adjacent tokens (local syntax)
-- Vertical bands → attending to specific positions (e.g., first token, delimiters)
-- Sparse patterns → selective attention (content-based)
-- Uniform patterns → broadcasting information equally
+### Step 1) Train a base Transformer (TinyStories)
 
-**Logit Lens:**
-- Early convergence → shallow features sufficient for task
-- Late refinement → complex reasoning happens in final layers
-- Layer jumps → sudden insight at specific depth
+Fast dev run (uses `/scratch/kk6081/picollm_extend/` by default):
 
-**Neuron Analysis:**
-- High activation concentration → monosemantic (interpretable)
-- Diverse activation contexts → polysemantic (distributed representation)
-- Layer trends → syntax → semantics → task-specific
+```bash
+bash scripts/train_transformer_fast.sh
+```
 
-### Tips for Interpretability Analysis
+After this you should have a checkpoint like:
+- `/scratch/kk6081/picollm_extend/transformer_epoch1.pt`
 
-1. **Use diverse prompts**: Test multiple domains (narrative, factual, arithmetic) to find specialized behaviors
-2. **Compare layers**: Look for specialization patterns across depth
-3. **Iterate on training**: Run interpretability after each epoch to track learning dynamics
-4. **Cross-reference**: Combine attention + neuron analysis to understand full circuits
-5. **Minimal examples**: Use short, clear prompts (3-10 tokens) for clearer patterns
+### Step 2) Test-time decoding / search (greedy / nucleus / beam / lookahead)
 
-### Further Reading
+Example:
 
-- **Anthropic's Interpretability Research**: https://transformer-circuits.pub/
-- **Distill.pub Articles**: https://distill.pub/
-- **Neel Nanda's TransformerLens**: https://github.com/neelnanda-io/TransformerLens
+```bash
+python inference.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
+  --prompt "Once upon a time" \
+  --decode lookahead \
+  --lookahead_k 8 --lookahead_h 6 \
+  --device cuda:0
+```
+
+Or run the pre-made grid:
+
+```bash
+bash scripts/run_tts_grid.sh transformer_epoch1.pt "Once upon a time" --fast
+```
+
+### Step 3) Finetune on reasoning data (OpenThoughts-114k)
+
+This script will (a) prepare HF data → text lines and (b) finetune from `--init_from`.
+
+```bash
+bash scripts/train_transformer_reasoning.sh
+```
+
+Expected outputs (copied back with a prefix):
+- `/scratch/kk6081/picollm_extend/transformer_reasoning_transformer_epoch1.pt`
+
+### Step 4) Evaluate reasoning (current metric is heuristic)
+
+```bash
+python scripts/eval_reasoning.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_reasoning_transformer_epoch1.pt \
+  --data data/open_thoughts_val.txt \
+  --decode greedy
+```
+
+### Step 5) Run interpretability on either checkpoint
+
+Base model:
+
+```bash
+python scripts/interpret_transformer.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
+  --analysis attention,logit_lens,neurons \
+  --out_dir /scratch/kk6081/picollm_extend/interpretability_base \
+  --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 \
+  --test_prompts "Once upon a time" "The cat sat on" \
+  --device cuda:0
+```
+
+Reasoning-finetuned model:
+
+```bash
+python scripts/interpret_transformer.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_reasoning_transformer_epoch1.pt \
+  --analysis attention,logit_lens,neurons \
+  --out_dir /scratch/kk6081/picollm_extend/interpretability_reasoning \
+  --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 \
+  --test_prompts "What is 2 + 2?" "If Alice has 3 apples" \
+  --device cuda:0
+```
 
 ## Requirements
 - Python 3.8+
