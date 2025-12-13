@@ -1,9 +1,12 @@
 # pico-llm (Transformer-only extension)
 
 Educational Transformer project with focus on mathematical reasoning:
-- **Base training** on Orca-Math-200k (math word problems) or TinyStories (general language)
+- **Base training** on Orca-Math-200k (Microsoft's 200k math word problems)
 - **Math reasoning**: GSM8K finetuning with optional RL refinement
-- **Interpretability** tooling inspired by Anthropic / Transformer Circuits
+- **Interpret# Using Orca-Math base checkpoint
+BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_epoch8.pt" \
+  EPOCHS=10 LR=3e-4 RUN_RL=1 \
+  bash scripts/train_transformer_gsm8k.shity** tooling inspired by Anthropic / Transformer Circuits
 
 ## Comprehensive flowchart
 
@@ -13,28 +16,17 @@ flowchart TD
 
   subgraph BASE["Stage 1: Base Training"]
     ORCA[train_transformer_orca.sh<br/>100k Orca-Math examples, 8 epochs<br/>⭐ RECOMMENDED]
-    TFULL[train_transformer_full.sh<br/>500k TinyStories, 5 epochs<br/>For general language]
     ORCA --> CKPT_MATH[transformer_epoch_N.pt]
-    TFULL --> CKPT_STORY[transformer_epoch_N.pt]
   end
 
   CKPT_MATH -->|init_from| GSM_MATH
-  CKPT_STORY -->|init_from| GSM_STORY
 
-  subgraph GSM_MATH["Stage 2A: GSM8K from Orca-Math RECOMMENDED"]
+  subgraph GSM_MATH["Stage 2: GSM8K Finetuning"]
     PREP_MATH[prepare_hf_gsm8k_data.sh<br/>openai/gsm8k] --> FILES_MATH[gsm8k_train.txt]
-    FILES_MATH --> SFT_MATH[train_transformer_gsm8k.sh<br/>10 epochs, LR=5e-4]
+    FILES_MATH --> SFT_MATH[train_transformer_gsm8k.sh<br/>10 epochs, LR=3e-4]
     SFT_MATH --> SFT_CKPT_MATH[gsm8k checkpoint]
     SFT_CKPT_MATH --> RL_MATH[RL Refinement<br/>400 steps]
-    RL_MATH --> FINAL_MATH[Final checkpoint<br/>40-55% accuracy ⭐]
-  end
-
-  subgraph GSM_STORY["Stage 2B: GSM8K from TinyStories"]
-    PREP_STORY[prepare_hf_gsm8k_data.sh<br/>openai/gsm8k] --> FILES_STORY[gsm8k_train.txt]
-    FILES_STORY --> SFT_STORY[train_transformer_gsm8k.sh<br/>10 epochs, LR=5e-4]
-    SFT_STORY --> SFT_CKPT_STORY[gsm8k checkpoint]
-    SFT_CKPT_STORY --> RL_STORY[RL Refinement<br/>400 steps]
-    RL_STORY --> FINAL_STORY[Final checkpoint<br/>25-40% accuracy]
+    RL_MATH --> FINAL_MATH[Final checkpoint<br/>45-60% accuracy ⭐]
   end
 
   subgraph EVAL["Evaluation"]
@@ -42,7 +34,6 @@ flowchart TD
   end
 
   FINAL_MATH --> E1
-  FINAL_STORY --> E1
 
   subgraph INTERP["Interpretability"]
     IT[interpret_transformer.py<br/>Attention + Neurons]
@@ -88,20 +79,6 @@ python scripts/eval_reasoning.py
 # Expected: 45-60% GSM8K accuracy with MEDIUM model!
 ```
 
-### Alternative: TinyStories Base (General Language)
-
-```bash
-# 1) Train on TinyStories (500k stories, 5 epochs - 3-6 hours)
-TINYSTORIES_SUBSET=500000 EPOCHS=5 bash scripts/train_transformer_full.sh
-
-# 2) Train GSM8K with HIGH LR to override narrative patterns
-BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_epoch3.pt" \
-  EPOCHS=10 LR=5e-4 RUN_RL=1 \
-  bash scripts/train_transformer_gsm8k.sh
-
-# Expected: 25-40% GSM8K accuracy (lower due to pattern contamination)
-```
-
 ### Quick Evaluation & Interpretability
 
 ```bash
@@ -129,24 +106,18 @@ python scripts/interpretability_viewer.py \
 
 ### Why Orca-Math Base?
 
-Traditional approach (TinyStories base) teaches narrative patterns that **contaminate** math training:
-- ❌ Repetition: "A: 20! A: 20! A: 20!"
-- ❌ Emotions: Excessive "!" and "?" 
-- ❌ Story patterns: "Once upon a time..." doesn't help with "x + 5 = 12"
-
-**Orca-Math base** provides clean mathematical reasoning patterns:
-- ✅ Step-by-step solutions with explanations
-- ✅ Math vocabulary: "Let's calculate...", "Therefore...", "We can solve..."
-- ✅ Natural transfer: Math word problems → GSM8K word problems
-- ✅ High quality: Microsoft-curated 200k dataset with verified solutions
+**Orca-Math base** provides clean mathematical reasoning patterns ideal for math tasks:
+- ✅ **Step-by-step solutions**: Clear explanations build strong reasoning chains
+- ✅ **Math vocabulary**: Natural phrases like "Let's calculate...", "Therefore...", "We can solve..."
+- ✅ **Natural transfer**: Math word problems → GSM8K word problems (same domain)
+- ✅ **High quality**: Microsoft-curated 200k dataset with verified solutions
+- ✅ **Clean format**: Q&A pairs without narrative artifacts or repetition
 
 ### Expected Results
 
 | Base Model | GSM8K Accuracy | Training Time | Notes |
 |------------|----------------|---------------|-------|
 | **Orca-Math** | **45-60%** | 20-24 hours | Clean word problems ⭐ |
-| TinyStories (high LR) | 25-40% | 15-19 hours | Must override story patterns |
-| TinyStories (low LR) | 7-15% | 10-14 hours | Contaminated outputs |
 
 ### Datasets Used
 
@@ -223,26 +194,19 @@ BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_epoch8.pt" \
   bash scripts/train_transformer_gsm8k.sh
 ```
 
-### Base Transformer Options
+### Base Transformer Training
 
-**Choose your base training data:**
-
-1. **TinyStories (Default)** - Good for general language modeling
-   - Fast dev: `bash scripts/train_transformer_fast.sh`
-   - Full run: `bash scripts/train_transformer_full.sh`
-   - ⚠️ **Warning**: Narrative patterns may contaminate math reasoning tasks
-
-2. **Orca-Math (RECOMMENDED for math)** - Microsoft's 200k math word problems
-   - `bash scripts/train_transformer_orca.sh`
-   - ✅ **Best for**: GSM8K, any math word problem tasks
-   - ✅ **No contamination**: Clean step-by-step solutions transfer naturally to GSM8K
+**Orca-Math (RECOMMENDED)** - Microsoft's 200k math word problems
+- Command: `bash scripts/train_transformer_orca.sh`
+- ✅ **Best for**: GSM8K and any math word problem tasks
+- ✅ **Clean transfer**: Step-by-step solutions naturally transfer to GSM8K
+- ✅ **High quality**: Curated dataset with verified solutions
 
 Scaling knobs (see `pico-llm.py`):
 - `--transformer_size {small,medium}`
-- `--tinystories_train_subset_size N`
 - Faster training knobs: `--sample_interval_seconds`, `--sample_every_steps`, `--lr_schedule`, `--lr_warmup_steps`, `--lr_min_ratio`
 
-If you hit OOM on 12GB:
+If you hit OOM on 12GB GPU:
 - `BATCH=8` (or `4`) and/or `TRANSFORMER_SIZE=small`
 
 ### Training Parameters
@@ -251,22 +215,22 @@ Environment variables to control training (work with all training scripts):
 ```bash
 # Model architecture
 TRANSFORMER_SIZE=medium          # small (384d, 4h, 3b) or medium (512d, 8h, 6b)
-TINYSTORIES_SUBSET=100000        # Number of TinyStories examples
+MAX_SAMPLES=100000              # Number of Orca-Math examples (from 200k available)
 
 # Training hyperparameters
 BATCH=16                         # Batch size (reduce to 8 or 4 if OOM)
-EPOCHS=3                         # Number of epochs
-LR=2e-4                          # Learning rate
-VAL_SPLIT=0.1                    # Validation split (0.1 = 10%)
+EPOCHS=8                         # Number of epochs (8 for Orca-Math base)
+LR=3e-4                          # Learning rate (3e-4 for Orca-Math)
+VAL_SPLIT=0.05                   # Validation split (0.05 = 5%)
 
 # LR scheduling
 LR_SCHEDULE=cosine               # none, cosine, or linear
-LR_WARMUP_STEPS=500              # Warmup steps for stability
-LR_MIN_RATIO=0.1                 # Min LR as fraction of base LR
+LR_WARMUP_STEPS=1000             # Warmup steps for stability
+LR_MIN_RATIO=0.2                 # Min LR as fraction of base LR
 
 # Sampling/logging
-SAMPLE_EVERY_STEPS=100           # Generate text every N steps (0=time-based)
-SAMPLE_INTERVAL_SECONDS=300      # Or every N seconds (if SAMPLE_EVERY_STEPS=0)
+SAMPLE_EVERY_STEPS=0             # Generate text every N steps (0=time-based)
+SAMPLE_INTERVAL_SECONDS=300      # Or every N seconds (default: 5 minutes)
 ```
 
 **Example**: Train medium model with larger batch
@@ -303,11 +267,6 @@ Downloads GSM8K dataset from HuggingFace and creates:
 BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_finemath_epoch5.pt" \
   EPOCHS=10 LR=5e-4 RUN_RL=1 \
   bash scripts/train_transformer_gsm8k.sh
-
-# OR with TinyStories base (higher LR needed)
-BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_epoch3.pt" \
-  EPOCHS=10 LR=5e-4 RUN_RL=1 \
-  bash scripts/train_transformer_gsm8k.sh
 ```
 
 **3. Evaluate**:
@@ -322,7 +281,7 @@ python scripts/eval_reasoning.py \
 | Parameter | Default | Notes |
 |-----------|---------|-------|
 | `EPOCHS` | 8 | Use 10 for better results |
-| `LR` | 3e-4 | Use 5e-4 with TinyStories base |
+| `LR` | 3e-4 | Standard for Orca-Math base |
 | `RUN_RL` | 1 | Set to 0 to skip RL refinement |
 | `RL_STEPS` | 400 | RL refinement iterations |
 | `RL_BATCH` | 12 | Batch size for RL |
@@ -396,13 +355,12 @@ Outputs:
 ## 📁 Repository Structure
 
 ### Training Scripts
-- `train_transformer_finemath.sh` ⭐ - Train base model on FineMath (math-focused)
-- `train_transformer_full.sh` - Train base model on TinyStories (general language)
-- `train_transformer_fast.sh` - Quick TinyStories training for testing
+- `train_transformer_orca.sh` ⭐ - Train base model on Orca-Math (math-focused)
 - `train_transformer_gsm8k.sh` - GSM8K finetuning + optional RL
+- `full_pipeline_orca.sh` - Complete pipeline (Orca-Math → GSM8K → RL)
 
 ### Data Preparation
-- `prepare_hf_finemath_data.py` - Download FineMath from HuggingFace
+- `prepare_orca_math_data.py` - Download Orca-Math-Word-Problems-200k from HuggingFace
 - `prepare_hf_gsm8k_data.sh` - Download GSM8K from HuggingFace
 
 ### Evaluation & Analysis
@@ -426,11 +384,12 @@ Outputs:
 
 | Task | Command | Time |
 |------|---------|------|
-| **Math base training** | `bash scripts/train_transformer_finemath.sh` | 6-8h |
+| **Full pipeline** | `bash scripts/full_pipeline_orca.sh` | 20-24h |
+| **Math base training** | `bash scripts/train_transformer_orca.sh` | 8-10h |
 | **GSM8K training** | `BASE_CKPT=... bash scripts/train_transformer_gsm8k.sh` | 12-14h |
 | **Evaluate GSM8K** | `python scripts/eval_reasoning.py --checkpoint ... --data data/gsm8k_test.txt` | 5-10m |
 | **Interpretability** | `python scripts/interpret_transformer.py --checkpoint ...` | 2-5m |
 | **View results** | `python scripts/interpretability_viewer.py --root ...` | instant |
 
-**Total time for best model**: ~20 hours (FineMath base + GSM8K + RL)
+**Total time for best model**: ~20-24 hours (Orca-Math base + GSM8K + RL)
 
