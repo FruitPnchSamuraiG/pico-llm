@@ -81,7 +81,15 @@ python scripts/interpret_transformer.py --checkpoint /scratch/kk6081/picollm_ext
   --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 --test_prompts "Once upon a time" --device cuda:0
 ```
 
-**💡 Pro tip**: Apply training improvements first for 30-50% faster convergence!
+**💡 Pro tip**: For better GSM8K results, see **[QUICK_FIX_GUIDE.md](QUICK_FIX_GUIDE.md)** for optimal training settings!
+
+## 📚 New: Improved Training Guides
+
+- **[QUICK_FIX_GUIDE.md](QUICK_FIX_GUIDE.md)** - How to fix poor reasoning outputs (READ THIS FIRST!)
+- **[HF_CURRICULUM_DATASETS.md](HF_CURRICULUM_DATASETS.md)** - Using HuggingFace datasets for curriculum learning ⭐NEW
+- **[TRAINING_IMPROVEMENT_PLAN.md](TRAINING_IMPROVEMENT_PLAN.md)** - Detailed analysis and roadmap
+- **[GRADIENT_NORMS_GUIDE.md](GRADIENT_NORMS_GUIDE.md)** - Understanding `grad_norm > 1` (it's normal!)
+- **[TRAINING_DEFAULTS.md](TRAINING_DEFAULTS.md)** - Complete hyperparameter reference
 
 ## 🚀 Quick Start: Apply Training Patches (RECOMMENDED)
 
@@ -183,6 +191,8 @@ Default: `open-thoughts/OpenThoughts-114k` -> exported to line-based text.
 bash scripts/train_transformer_reasoning.sh
 ```
 
+**Auto-selects base checkpoint**: Scripts automatically use the **latest epoch checkpoint** (highest epoch number) from `/scratch/kk6081/picollm_extend/transformer_epoch*.pt`. Override with `BASE_CKPT=/path/to/checkpoint.pt` if needed.
+
 Outputs copied back as:
 - `/scratch/kk6081/picollm_extend/transformer_reasoning_transformer_epoch*.pt`
 
@@ -198,10 +208,22 @@ Train:
 bash scripts/train_transformer_gsm8k.sh
 ```
 
+**Auto-selects base checkpoint**: Scripts automatically use the **latest epoch checkpoint** (highest epoch number) from `/scratch/kk6081/picollm_extend/transformer_epoch*.pt`. Override with `BASE_CKPT=/path/to/checkpoint.pt` if needed.
+
+**Default training:** 3 epochs SFT (~2-3 hours) + 400 steps RL (~30-45 min) = **~3-4 hours total**
+
+**Quick test mode** (for debugging):
+```bash
+EPOCHS=1 MAX_STEPS=500 RUN_RL=0 bash scripts/train_transformer_gsm8k.sh
+```
+
 Notes:
-- Stage 1: SFT finetune -> checkpoints copied back as `transformer_gsm8k_transformer_epoch*.pt`
-- Stage 2: RL-style outcome post-training (default **enabled**; disable via `RUN_RL=0`)
+- Stage 1: SFT finetune (3 epochs, full dataset by default) → `transformer_gsm8k_transformer_epoch*.pt`
+- Stage 2: RL-style outcome post-training (400 steps, batch=12, samples=8, **enabled** by default)
+  - Disable via `RUN_RL=0`
+  - Uses latest SFT checkpoint automatically
   - Output copied back as `/scratch/kk6081/picollm_extend/transformer_gsm8k_rl.pt`
+- 📖 See **[TRAINING_DEFAULTS.md](TRAINING_DEFAULTS.md)** for parameter details and override examples
 
 RL reading pointers:
 - DeepSeek-R1: https://arxiv.org/abs/2501.12948

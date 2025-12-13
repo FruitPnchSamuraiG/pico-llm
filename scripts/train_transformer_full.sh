@@ -12,10 +12,12 @@ DEVICE=${DEVICE:-cuda:0}
 OUTDIR=${OUTDIR:-/scratch/kk6081/picollm_extend}
 
 # Larger defaults (override via env vars)
+# IMPORTANT: For good GSM8K reasoning, use 500k-1M stories with 5-8 epochs
+# Old defaults (200k×3) were too small for strong language modeling
 TRANSFORMER_SIZE=${TRANSFORMER_SIZE:-medium}
-TINYSTORIES_SUBSET=${TINYSTORIES_SUBSET:-200000}
+TINYSTORIES_SUBSET=${TINYSTORIES_SUBSET:-500000}  # Increased from 200k to 500k
 
-EPOCHS=${EPOCHS:-3}
+EPOCHS=${EPOCHS:-5}          # Increased from 3 to 5 for better base model
 BATCH=${BATCH:-16}
 LR=${LR:-2e-4}
 VAL_SPLIT=${VAL_SPLIT:-0.05}

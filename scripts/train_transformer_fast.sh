@@ -13,10 +13,10 @@ OUTDIR=${OUTDIR:-/scratch/kk6081/picollm_extend}
 
 # Larger defaults (override via env vars)
 TRANSFORMER_SIZE=${TRANSFORMER_SIZE:-medium}
-TINYSTORIES_SUBSET=${TINYSTORIES_SUBSET:-100000}
+TINYSTORIES_SUBSET=${TINYSTORIES_SUBSET:-200000}  # Increased from 100k to 200k for better base
 
-EPOCHS=${EPOCHS:-1}
-MAX_STEPS=${MAX_STEPS:-200}
+EPOCHS=${EPOCHS:-5}              # Increased from 1 to 5 for stronger base model
+MAX_STEPS=${MAX_STEPS:-999999}   # Removed limit - train on full subset
 BATCH=${BATCH:-16}
 LR=${LR:-2e-4}
 VAL_SPLIT=${VAL_SPLIT:-0.05}

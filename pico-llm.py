@@ -312,6 +312,16 @@ class KGramMLPSeqModel(nn.Module):
         # Set the current network as a sequential model of the above layers
         self.net = nn.Sequential(*layers)
 
+
+    def _init_weights(self, module):
+        """Initialize weights following GPT-2 conventions for training stability."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, tokens_seq):
         """
         Process sequence autoregressively: predict each position from its k-token history.
@@ -382,6 +392,16 @@ class LSTMSeqModel(nn.Module):
         # batch_first=False means input shape is (seq_len, batch, embed_size)
         self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=False)
         self.linear = nn.Linear(hidden_size, vocab_size)
+
+
+    def _init_weights(self, module):
+        """Initialize weights following GPT-2 conventions for training stability."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, tokens_seq):
         """
@@ -612,6 +632,26 @@ class TransformerModel(nn.Module):
         # Shape: (1, block_size, block_size), 1 = allowed, 0 = masked
         causal = torch.tril(torch.ones(block_size, block_size, dtype=torch.uint8))
         self.register_buffer("causal_mask", causal.unsqueeze(0))  # Save as non-trainable buffer
+        
+        # Initialize weights properly (GPT-2 style)
+        self.apply(self._init_weights)
+        
+        # Scale residual connection weights for stability in deep networks
+        for block in self.blocks:
+            torch.nn.init.normal_(block.out_proj.weight, mean=0.0, std=0.02/math.sqrt(2 * n_blocks))
+            for layer in block.ff:
+                if isinstance(layer, nn.Linear):
+                    torch.nn.init.normal_(layer.weight, mean=0.0, std=0.02/math.sqrt(2 * n_blocks))
+
+
+    def _init_weights(self, module):
+        """Initialize weights following GPT-2 conventions for training stability."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, tokens_seq):
         """
@@ -881,8 +921,14 @@ def train_one_model(model,
     elif warmup=='no':
         optimizer = optim.SGD(model.parameters(), lr=lr)
     else:
-        # Use AdamW optimizer
-        optimizer = optim.AdamW(model.parameters(), lr=lr)
+        # Use AdamW optimizer with improved hyperparameters
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            betas=(0.9, 0.95),  # Lower beta2 for better convergence
+            weight_decay=weight_decay,
+            eps=1e-8
+        )
 
     # ===== LR scheduler (for AdamW runs) =====
     # Note: the existing --warmup flag uses SGD (optionally with warmup). We keep that behavior.
@@ -922,6 +968,11 @@ def train_one_model(model,
     # Track loss history for plotting
     train_loss_history = []
     val_loss_history = []
+    
+    # Early stopping variables
+    best_val_loss = float('inf')
+    patience = 3  # Stop if no improvement for 3 epochs
+    patience_counter = 0
 
     for epoch in range(1, epochs + 1):
         model.train()  # Set model to training mode (enables dropout, etc.)
@@ -966,9 +1017,23 @@ def train_one_model(model,
             # Log training progress at regular intervals
             if batch_idx % log_steps == 0:
                 avg_part_loss = partial_loss / partial_count
+                
+                # Calculate gradient norm for monitoring stability
+                total_grad_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_grad_norm += param_norm.item() ** 2
+                total_grad_norm = total_grad_norm ** 0.5
+                
+                # Get current learning rate
+                current_lr = optimizer.param_groups[0]['lr']
+                
                 print(f"[{model_name}] Epoch {epoch}/{epochs}, "
                       f"Step {batch_idx}/{len(loader)} (global step: {global_step}) "
-                      f"Partial Avg Loss: {avg_part_loss:.4f}")
+                      f"Loss: {avg_part_loss:.4f}, "
+                      f"Grad_norm: {total_grad_norm:.3f}, "
+                      f"LR: {current_lr:.2e}")
                 # Reset partial counters
                 partial_loss = 0.0
                 partial_count = 0
