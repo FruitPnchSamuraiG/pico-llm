@@ -1,7 +1,16 @@
 # pico-llm (Transformer-only extension)
 
-Educational Transformer-only project:
-- **Base training** on TinyStories subsets
+Educational Transformer-only p  CKPT1 --> IT
+  OTCKPT --> IT
+  CURRGSMCKPT --> IT
+  CURRCKPT --> IT
+  GSMCKPT --> IT
+  RLCKPT --> IT
+
+  style CURR fill:#d4edda,stroke:#28a745,stroke-width:3px
+  style TFULL fill:#d4edda,stroke:#28a745,stroke-width:2px
+  style CURDATA fill:#fff3cd,stroke:#ffc107,stroke-width:2px
+``` **Base training** on TinyStories subsets
 - **Reasoning**: HF dataset export -> SFT finetune, plus **optional RL-style outcome post-training**
 - **Interpretability** tooling inspired by Anthropic / Transformer Circuits
 
@@ -28,14 +37,19 @@ flowchart TD
     OTFILES --> OTSFT
   end
 
-  subgraph CURR["Stage 2B: Curriculum Learning NEW"]
+  subgraph CURR["Stage 2B: Curriculum Learning RECOMMENDED"]
     CURDATA[bash scripts/train_curriculum_math.sh<br/>Auto-downloads HuggingFace datasets]
     CURDATA --> ARITHDATA[python scripts/prepare_hf_arithmetic_data.py<br/>ASDiv MathQA Simple]
     ARITHDATA --> ARITHFILES[data/curriculum_arith_train.txt<br/>data/curriculum_arith_val.txt]
     ARITHFILES --> ARITHSFT[Arithmetic SFT 3 epochs<br/>Elementary math problems]
     ARITHSFT --> ARITHCKPT[curriculum_arith/transformer_epoch_N.pt]
     ARITHCKPT --> CURRGSM[GSM8K SFT 8-10 epochs<br/>Complex reasoning]
-    CURRGSM --> CURRCKPT[curriculum_gsm8k/transformer_epoch_N.pt]
+    CURRGSM --> CURRGSMCKPT[curriculum_gsm8k/transformer_epoch_N.pt]
+    
+    CURRGSMCKPT -->|RUN_RL=1 default| CURRRL
+    subgraph CURRRL["RL Refinement best-of-n"]
+      CURRRLSTEP[python scripts/rl_reasoning_outcome.py<br/>400 steps] --> CURRCKPT[curriculum_gsm8k/transformer_rl.pt]
+    end
   end
 
   subgraph GSM["Stage 2C: Direct GSM8K SFT + RL"]
@@ -163,8 +177,8 @@ bash scripts/train_curriculum_math.sh
 **What it does:**
 1. **Downloads HuggingFace datasets** (ASDiv elementary math, simple arithmetic)
 2. **Arithmetic stage** (3 epochs): Learns basic operations + word problems
-3. **GSM8K stage** (8-10 epochs): Learns complex multi-step reasoning
-4. **Optional RL** (400 steps): Refines answer selection
+3. **GSM8K SFT stage** (8 epochs): Learns complex multi-step reasoning
+4. **RL refinement** (400 steps): Improves answer selection via best-of-n sampling
 
 **Datasets used (auto-downloaded):**
 - **ASDiv**: 2,000 elementary school math problems (natural language word problems)
@@ -294,8 +308,8 @@ bash scripts/train_curriculum_math.sh
 **What it does:**
 1. Downloads HuggingFace datasets (ASDiv, simple arithmetic)
 2. Trains on elementary math (3 epochs, 2-3 hours)
-3. Trains on GSM8K reasoning (8-10 epochs, 6-8 hours)
-4. Optional RL refinement (400 steps, 2-3 hours)
+3. Trains on GSM8K reasoning (8 epochs SFT, 6-8 hours)
+4. RL refinement (400 steps, 2-3 hours)
 
 **Expected accuracy:** 35-50% with MEDIUM model (vs 7-10% without curriculum)
 

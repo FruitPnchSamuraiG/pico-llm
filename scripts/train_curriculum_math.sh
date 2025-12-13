@@ -81,14 +81,22 @@ python pico-llm.py \
 ARITH_CKPT=$(ls -1 "$FT_SUBDIR"/transformer_epoch*.pt | tail -1)
 cp "$ARITH_CKPT" "$OUTDIR/transformer_arith_final.pt"
 
-# Stage 3: GSM8K training (8 epochs)
+# Stage 3: GSM8K training (8 epochs) + RL refinement (400 steps)
 echo ""
-echo "🔹 Stage 3: GSM8K Training (8 epochs)"
-BASE_CKPT="$OUTDIR/transformer_arith_final.pt" EPOCHS=8 \
+echo "🔹 Stage 3: GSM8K Training (8 epochs SFT + 400 steps RL)"
+BASE_CKPT="$OUTDIR/transformer_arith_final.pt" EPOCHS=8 RUN_RL=1 \
   bash scripts/train_transformer_gsm8k.sh
 
 echo ""
 echo "=========================================="
 echo "✅ Curriculum training complete!"
-echo "Final checkpoints in: $OUTDIR"
+echo ""
+echo "Checkpoints created:"
+echo "  - Arithmetic checkpoint: $OUTDIR/transformer_arith_final.pt"
+echo "  - GSM8K SFT checkpoints: $OUTDIR/transformer_gsm8k_transformer_epoch*.pt"
+echo "  - GSM8K RL checkpoint: $OUTDIR/transformer_gsm8k_rl.pt"
+echo ""
+echo "Next steps:"
+echo "  1. Evaluate: python scripts/eval_reasoning.py"
+echo "  2. Use best checkpoint for inference"
 echo "=========================================="
