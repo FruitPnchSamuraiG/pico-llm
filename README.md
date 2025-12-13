@@ -1,16 +1,7 @@
 # pico-llm (Transformer-only extension)
 
-Educational Transformer-only p  CKPT1 --> IT
-  OTCKPT --> IT
-  CURRGSMCKPT --> IT
-  CURRCKPT --> IT
-  GSMCKPT --> IT
-  RLCKPT --> IT
-
-  style CURR fill:#d4edda,stroke:#28a745,stroke-width:3px
-  style TFULL fill:#d4edda,stroke:#28a745,stroke-width:2px
-  style CURDATA fill:#fff3cd,stroke:#ffc107,stroke-width:2px
-``` **Base training** on TinyStories subsets
+Educational Transformer-only project:
+- **Base training** on TinyStories subsets
 - **Reasoning**: HF dataset export -> SFT finetune, plus **optional RL-style outcome post-training**
 - **Interpretability** tooling inspired by Anthropic / Transformer Circuits
 
