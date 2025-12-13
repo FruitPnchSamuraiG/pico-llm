@@ -11,28 +11,28 @@ Educational Transformer-only project:
 flowchart TD
   VENV[Activate venv<br/>/scratch/kk6081/ml_fall25/venv/] --> BASE
 
-  subgraph BASE["Stage 1: Base Transformer training (TinyStories)"]
-    TFAST[bash scripts/train_transformer_fast.sh] --> CKPT1[/scratch/.../transformer_epoch*.pt]
+  subgraph BASE["Stage 1: Base Transformer training TinyStories"]
+    TFAST[bash scripts/train_transformer_fast.sh] --> CKPT1[transformer_epoch_N.pt]
     TFULL[bash scripts/train_transformer_full.sh] --> CKPT1
   end
 
   CKPT1 -->|init_from| OT
   CKPT1 -->|init_from| GSM
 
-  subgraph OT["Stage 2A: OpenThoughts SFT (no RL)"]
+  subgraph OT["Stage 2A: OpenThoughts SFT no RL"]
     OTDATA[python scripts/prepare_hf_reasoning_data.py<br/>dataset: open-thoughts/OpenThoughts-114k] --> OTFILES[data/open_thoughts_train.txt<br/>data/open_thoughts_val.txt]
-    OTSFT[bash scripts/train_transformer_reasoning.sh] --> OTCKPT[/scratch/.../transformer_reasoning_transformer_epoch*.pt]
+    OTSFT[bash scripts/train_transformer_reasoning.sh] --> OTCKPT[transformer_reasoning_transformer_epoch_N.pt]
     OTFILES --> OTSFT
   end
 
   subgraph GSM["Stage 2B: GSM8K SFT + RL-outcome"]
     GSM_PREP[bash scripts/prepare_hf_gsm8k_data.sh<br/>dataset: openai/gsm8k main] --> GSMFILES[data/gsm8k_train.txt<br/>data/gsm8k_val.txt<br/>data/gsm8k_test.txt]
-    GSMSFT[bash scripts/train_transformer_gsm8k.sh<br/>Stage 1: SFT] --> GSMCKPT[/scratch/.../transformer_gsm8k_transformer_epoch*.pt]
+    GSMSFT[bash scripts/train_transformer_gsm8k.sh<br/>Stage 1: SFT] --> GSMCKPT[transformer_gsm8k_transformer_epoch_N.pt]
     GSMFILES --> GSMSFT
 
     GSMSFT -->|RUN_RL=1 default| RLOUT
-    subgraph RLOUT["Stage 2: RL-style outcome post-training (best-of-n)"]
-      RL[python scripts/rl_reasoning_outcome.py] --> RLCKPT[/scratch/.../transformer_gsm8k_rl.pt]
+    subgraph RLOUT["Stage 2: RL-style outcome post-training best-of-n"]
+      RL[python scripts/rl_reasoning_outcome.py] --> RLCKPT[transformer_gsm8k_rl.pt]
     end
   end
 
@@ -45,7 +45,7 @@ flowchart TD
   RLCKPT --> E1
 
   subgraph INTERP["Interpretability"]
-    IT[python scripts/interpret_transformer.py] --> IOUT[/scratch/.../interpretability_*]
+    IT[python scripts/interpret_transformer.py] --> IOUT[interpretability output dir]
     IOUT --> VIEW[python scripts/interpretability_viewer.py<br/>Web UI]
   end
 
