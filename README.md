@@ -111,6 +111,18 @@ python scripts/eval_reasoning.py \
 
 Tool: `scripts/interpret_transformer.py` (attention heatmaps, logit lens, neuron max-activation contexts, patching stub).
 
+### Web UI (browse saved results)
+
+After you generate results with `interpret_transformer.py`, you can browse them with a lightweight local web UI:
+
+```bash
+python scripts/interpretability_viewer.py \
+  --root /scratch/kk6081/picollm_extend/interpretability_test \
+  --host 127.0.0.1 --port 8000
+```
+
+Then open: `http://127.0.0.1:8000/`
+
 Transformer Circuits hub:
 - https://transformer-circuits.pub/
 
