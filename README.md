@@ -2,9 +2,58 @@
 
 Educational Transformer-only project:
 - **Base training** on TinyStories subsets
-- **Decoding / test-time search**: greedy / nucleus / beam / **Lookahead Nucleus Search (LNS)**
 - **Reasoning**: HF dataset export -> SFT finetune, plus **optional RL-style outcome post-training**
 - **Interpretability** tooling inspired by Anthropic / Transformer Circuits
+
+## Comprehensive flowchart
+
+```mermaid
+flowchart TD
+  VENV[Activate venv<br/>/scratch/kk6081/ml_fall25/venv/] --> BASE
+
+  subgraph BASE[Stage 1: Base Transformer training (TinyStories)]
+    TFAST[bash scripts/train_transformer_fast.sh] --> CKPT1[/scratch/.../transformer_epoch*.pt/]
+    TFULL[bash scripts/train_transformer_full.sh] --> CKPT1
+  end
+
+  CKPT1 -->|init_from| OT
+  CKPT1 -->|init_from| GSM
+
+  subgraph OT[Stage 2A: OpenThoughts SFT (no RL)]
+    OTDATA[python scripts/prepare_hf_reasoning_data.py<br/>dataset: open-thoughts/OpenThoughts-114k] --> OTFILES[data/open_thoughts_{train,val}.txt]
+    OTSFT[bash scripts/train_transformer_reasoning.sh] --> OTCKPT[/scratch/.../transformer_reasoning_transformer_epoch*.pt/]
+    OTFILES --> OTSFT
+  end
+
+  subgraph GSM[Stage 2B: GSM8K SFT + RL-outcome]
+    GSM_PREP[bash scripts/prepare_hf_gsm8k_data.sh<br/>dataset: openai/gsm8k (main)] --> GSMFILES[data/gsm8k_{train,val,test}.txt]
+    GSMSFT[bash scripts/train_transformer_gsm8k.sh<br/>Stage 1: SFT] --> GSMCKPT[/scratch/.../transformer_gsm8k_transformer_epoch*.pt/]
+    GSMFILES --> GSMSFT
+
+    GSMSFT -->|RUN_RL=1 (default)| RLOUT
+    subgraph RLOUT[Stage 2: RL-style outcome post-training (best-of-n)]
+      RL[python scripts/rl_reasoning_outcome.py] --> RLCKPT[/scratch/.../transformer_gsm8k_rl.pt/]
+    end
+  end
+
+  subgraph EVAL[Evaluation]
+    E1[python scripts/eval_reasoning.py<br/>(heuristic numeric accuracy)]
+  end
+
+  OTCKPT --> E1
+  GSMCKPT --> E1
+  RLCKPT --> E1
+
+  subgraph INTERP[Interpretability]
+    IT[python scripts/interpret_transformer.py] --> IOUT[/scratch/.../interpretability_*/]
+    IOUT --> VIEW[python scripts/interpretability_viewer.py<br/>Web UI]
+  end
+
+  CKPT1 --> IT
+  OTCKPT --> IT
+  GSMCKPT --> IT
+  RLCKPT --> IT
+```
 
 ## Environment / constraints
 - GPU: 2x GTX TITAN X (12GB). Default device: **`cuda:0`**
@@ -20,17 +69,13 @@ cd /home/kk6081/pico_llm_extend/pico-llm
 # 1) Train base transformer
 bash scripts/train_transformer_fast.sh
 
-# 2) Decode (includes LNS)
-python inference.py --model transformer --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
-  --prompt "Once upon a time" --decode lookahead --lookahead_k 8 --lookahead_h 6 --device cuda:0
-
-# 3) Reasoning finetune (OpenThoughts SFT)
+# 2) Reasoning finetune (OpenThoughts SFT)
 bash scripts/train_transformer_reasoning.sh
 
-# 4) GSM8K SFT + RL-outcome (default RUN_RL=1)
+# 3) GSM8K SFT + RL-outcome (default RUN_RL=1)
 bash scripts/train_transformer_gsm8k.sh
 
-# 5) Interpretability
+# 4) Interpretability
 python scripts/interpret_transformer.py --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
   --analysis attention,logit_lens,neurons --out_dir /scratch/kk6081/picollm_extend/interpretability_base \
   --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 --test_prompts "Once upon a time" --device cuda:0
@@ -49,20 +94,6 @@ Scaling knobs (see `pico-llm.py`):
 
 If you hit OOM on 12GB:
 - `BATCH=8` (or `4`) and/or `TRANSFORMER_SIZE=small`
-
-## Decoding / test-time search
-
-`inference.py` supports:
-- `--decode greedy`
-- `--decode nucleus`
-- `--decode beam`
-- `--decode lookahead` (**Lookahead Nucleus Search / LNS**)
-
-LNS summary: pick the next token by scoring top-K candidates using a short H-step rollout:
-
-**score = avg_logprob(rollout) - rep_penalty * repetition(rollout)**
-
-(Implementation: `inference.py: decode_lookahead_search`.)
 
 ## Reasoning: datasets + training
 
@@ -103,8 +134,7 @@ Heuristic numeric accuracy (works best with GSM8K / synthetic arithmetic):
 ```bash
 python scripts/eval_reasoning.py \
   --checkpoint /scratch/kk6081/picollm_extend/transformer_gsm8k_transformer_epoch1.pt \
-  --data data/gsm8k_test.txt \
-  --decode greedy
+  --data data/gsm8k_test.txt
 ```
 
 ## Interpretability & analysis
