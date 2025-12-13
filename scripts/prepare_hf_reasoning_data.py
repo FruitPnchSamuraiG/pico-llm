@@ -166,8 +166,8 @@ def main() -> None:
     out_train = Path(args.out_train)
     out_val = Path(args.out_val)
 
-    n_train = _write_lines(out_train, _iter_text(ds_train, args.limit_train, args.min_chars))
-    n_val = _write_lines(out_val, _iter_text(ds_val, args.limit_val, args.min_chars))
+    n_train = _write_lines(out_train, _iter_text(ds_train, args.limit_train, args.min_chars)) # type: ignore
+    n_val = _write_lines(out_val, _iter_text(ds_val, args.limit_val, args.min_chars)) # type: ignore
 
     print("✅ Wrote:")
     print(f"  train: {out_train} (n={n_train})")

@@ -1232,7 +1232,7 @@ def main():
         transformer_model = models["transformer"]
         # enable caching
         for blk in transformer_model.blocks:
-            blk.save_attention = True
+            blk.save_attention = True # type: ignore
         with torch.no_grad():
             tok = torch.tensor(enc.encode(args.prompt), dtype=torch.long, device=device).unsqueeze(1)
             _ = transformer_model(tok)
@@ -1260,7 +1260,7 @@ def main():
                 plt.close()
         # disable caching
         for blk in transformer_model.blocks:
-            blk.save_attention = False
+            blk.save_attention = False # type: ignore
 
     # Save loss histories for plotting
     import pickle
