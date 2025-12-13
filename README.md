@@ -68,7 +68,7 @@ flowchart TD
   RLCKPT --> IT
 
   classDef recommended fill:#d4edda,stroke:#28a745,stroke-width:3px
-  classDef warning fill:#fff3cd,stroke:#ffc107,stroke-width:2px
+  classDef warning fill:#fff3cd,stroke:#28a745,stroke-width:3px
   
   class CURR,TFULL,CURRSTART,CURRCKPT recommended
   class TFAST,GSM warning
