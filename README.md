@@ -40,13 +40,26 @@ source /scratch/kk6081/ml_fall25/venv/bin/activate
 
 ### 1) Fast dev: train a small Transformer checkpoint
 
+This repo adds two training flags to scale up Transformer training:
+- `--transformer_size {small,medium}`
+  - `small`: `embed=384 heads=4 blocks=3 ff_mult=2`
+  - `medium`: `embed=512 heads=8 blocks=6 ff_mult=4`
+- `--tinystories_train_subset_size N` (default `20000`)
+
+The helper scripts are set up with larger defaults (override via env vars):
+- `scripts/train_transformer_fast.sh`: `TRANSFORMER_SIZE=medium`, `TINYSTORIES_SUBSET=100000`
+- `scripts/train_transformer_full.sh`: `TRANSFORMER_SIZE=medium`, `TINYSTORIES_SUBSET=200000`
+
+Run fast dev training:
+
 ```bash
 bash scripts/train_transformer_fast.sh
 ```
 
-Outputs (default):
-- `/scratch/kk6081/picollm_extend/transformer_epoch*.pt`
-- `/scratch/kk6081/picollm_extend/loss_histories.pkl`
+If you hit out-of-memory (12GB GPU), try:
+- `BATCH=8` (or `4`)
+- `BLOCK_SIZE=256`
+- `TRANSFORMER_SIZE=small`
 
 ### 2) Test-time decoding/search experiments
 

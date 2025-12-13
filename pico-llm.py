@@ -21,6 +21,15 @@ def parse_args():
                         help="Optional list of text files to mix in as data sources. Each line is one example (up to block_size).")
     parser.add_argument("--tinystories_weight", type=float, default=0.5,
                         help="Probability of sampling from TinyStories if present. Default=0.5. (set to 0.0 to skip TinyStories).")
+
+    # NEW: TinyStories subset size control
+    parser.add_argument(
+        "--tinystories_train_subset_size",
+        type=int,
+        default=20000,
+        help="How many TinyStories train examples to load (default: 20000). Increase for larger training.",
+    )
+
     parser.add_argument("--max_steps_per_epoch", type=int, default=None,
                         help="If set, each epoch ends after this many steps (for quick tests).")
     parser.add_argument("--num_inner_mlp_layers", type=int, default=1,
@@ -71,6 +80,18 @@ def parse_args():
     parser.add_argument("--warmup", type=str, default='', 
                         help="Set to 'yes' or 'no'. If set to either, SGD will be enabled instead of Adam")
     
+    # NEW: convenience preset for larger transformer training
+    parser.add_argument(
+        "--transformer_size",
+        type=str,
+        default="small",
+        choices=["small", "medium"],
+        help=(
+            "Convenience preset that sets embed_size/heads/blocks/ff_mult. "
+            "Overrides individual flags if provided. small=384/4/3/2, medium=512/8/6/4."
+        ),
+    )
+
     # Training stability and quality improvements
     # parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm. Prevents exploding gradients.")
     # parser.add_argument("--weight_decay", type=float, default=0.01, help="L2 regularization weight decay for AdamW.")
@@ -94,6 +115,19 @@ def parse_args():
     )
 
     args = parser.parse_args()
+
+    # Apply transformer size preset (only affects transformer hyperparams)
+    if args.transformer_size == "small":
+        args.embed_size = 384
+        args.transformer_heads = 4
+        args.transformer_blocks = 3
+        args.ff_mult = 2
+    elif args.transformer_size == "medium":
+        args.embed_size = 512
+        args.transformer_heads = 8
+        args.transformer_blocks = 6
+        args.ff_mult = 4
+
     return args
 
 
@@ -965,7 +999,7 @@ def main():
     warmup = args.warmup # Enable SGD, toggle warmup
 
     block_size = args.block_size  # Maximum sequence length
-    train_subset_size = 20000
+    train_subset_size = args.tinystories_train_subset_size
     log_interval_steps = 100  # Print loss every N steps
     sample_interval_seconds = 30 # Generate text every N seconds
 

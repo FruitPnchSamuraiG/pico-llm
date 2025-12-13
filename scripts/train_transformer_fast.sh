@@ -11,27 +11,25 @@ source /scratch/kk6081/ml_fall25/venv/bin/activate
 DEVICE=${DEVICE:-cuda:0}
 OUTDIR=${OUTDIR:-/scratch/kk6081/picollm_extend}
 
-# Fast defaults (12GB TITAN X friendly)
-BLOCK_SIZE=${BLOCK_SIZE:-256}
-EMBED=${EMBED:-384}
-HEADS=${HEADS:-4}
-BLOCKS=${BLOCKS:-3}
-FF_MULT=${FF_MULT:-2}
-BATCH=${BATCH:-16}
+# Larger defaults (override via env vars)
+TRANSFORMER_SIZE=${TRANSFORMER_SIZE:-medium}
+TINYSTORIES_SUBSET=${TINYSTORIES_SUBSET:-100000}
+
 EPOCHS=${EPOCHS:-1}
 MAX_STEPS=${MAX_STEPS:-200}
+BATCH=${BATCH:-16}
 LR=${LR:-2e-4}
-TINYSTORIES_WEIGHT=${TINYSTORIES_WEIGHT:-0.5}
 VAL_SPLIT=${VAL_SPLIT:-0.05}
+BLOCK_SIZE=${BLOCK_SIZE:-256}
 
 PROMPT=${PROMPT:-"Once upon a time"}
 
 echo "=========================================="
 echo "⚡ Fast Transformer Training"
 echo "Device: $DEVICE"
-echo "block_size=$BLOCK_SIZE embed=$EMBED heads=$HEADS blocks=$BLOCKS ff_mult=$FF_MULT"
+echo "transformer_size=$TRANSFORMER_SIZE tinystories_subset=$TINYSTORIES_SUBSET"
 echo "batch=$BATCH epochs=$EPOCHS max_steps_per_epoch=$MAX_STEPS lr=$LR"
-echo "tinystories_weight=$TINYSTORIES_WEIGHT val_split=$VAL_SPLIT"
+echo "val_split=$VAL_SPLIT"
 echo "outdir=$OUTDIR"
 echo "=========================================="
 
@@ -39,11 +37,11 @@ python pico-llm.py \
   --enable_transformer --disable_lstm \
   --device_id "$DEVICE" \
   --checkpoint_dir "$OUTDIR" \
+  --transformer_size "$TRANSFORMER_SIZE" \
+  --tinystories_train_subset_size "$TINYSTORIES_SUBSET" \
   --batch_size "$BATCH" --num_epochs "$EPOCHS" --max_steps_per_epoch "$MAX_STEPS" \
-  --block_size "$BLOCK_SIZE" --embed_size "$EMBED" \
-  --transformer_heads "$HEADS" --transformer_blocks "$BLOCKS" --ff_mult "$FF_MULT" \
+  --block_size "$BLOCK_SIZE" \
   --learning_rate "$LR" \
-  --tinystories_weight "$TINYSTORIES_WEIGHT" \
   --val_split "$VAL_SPLIT" \
   --prompt "$PROMPT"
 
