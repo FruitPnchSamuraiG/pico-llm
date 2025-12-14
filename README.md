@@ -1,395 +1,136 @@
-# pico-llm (Transformer-only extension)
+# pico-llm
 
-Educational Transformer project with focus on mathematical reasoning:
-- **Base training** on Orca-Math-200k (Microsoft's 200k math word problems)
-- **Math reasoning**: GSM8K finetuning with optional RL refinement
-- **Interpret# Using Orca-Math base checkpoint
-BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_epoch8.pt" \
-  EPOCHS=10 LR=3e-4 RUN_RL=1 \
-  bash scripts/train_transformer_gsm8k.shity** tooling inspired by Anthropic / Transformer Circuits
+A small transformer for math reasoning, trained on Orca-Math and fine-tuned on GSM8K.
 
-## Comprehensive flowchart
+Includes interpretability tools for analyzing attention patterns and neuron activations. Supports models from 10M to 1.5B parameters.
 
-```mermaid
-flowchart TD
-  VENV[Activate venv<br/>/scratch/kk6081/ml_fall25/venv/] --> BASE
-
-  subgraph BASE["Stage 1: Base Training"]
-    ORCA[train_transformer_orca.sh<br/>100k Orca-Math examples, 8 epochs<br/>⭐ RECOMMENDED]
-    ORCA --> CKPT_MATH[transformer_epoch_N.pt]
-  end
-
-  CKPT_MATH -->|init_from| GSM_MATH
-
-  subgraph GSM_MATH["Stage 2: GSM8K Finetuning"]
-    PREP_MATH[prepare_hf_gsm8k_data.sh<br/>openai/gsm8k] --> FILES_MATH[gsm8k_train.txt]
-    FILES_MATH --> SFT_MATH[train_transformer_gsm8k.sh<br/>10 epochs, LR=3e-4]
-    SFT_MATH --> SFT_CKPT_MATH[gsm8k checkpoint]
-    SFT_CKPT_MATH --> RL_MATH[RL Refinement<br/>400 steps]
-    RL_MATH --> FINAL_MATH[Final checkpoint<br/>45-60% accuracy ⭐]
-  end
-
-  subgraph EVAL["Evaluation"]
-    E1[eval_reasoning.py<br/>Test set accuracy]
-  end
-
-  FINAL_MATH --> E1
-
-  subgraph INTERP["Interpretability"]
-    IT[interpret_transformer.py<br/>Attention + Neurons]
-    IT --> VIEW[interpretability_viewer.py<br/>Web UI]
-  end
-
-  CKPT_MATH --> IT
-  FINAL_MATH --> IT
-
-  classDef recommended fill:#d4edda,stroke:#28a745,stroke-width:3px,color:#000
-  classDef alternative fill:#fff3cd,stroke:#ffc107,stroke-width:2px,color:#000
-  
-  class ORCA,GSM_MATH,FINAL_MATH recommended
-  class TFULL,GSM_STORY,FINAL_STORY alternative
-  
-  linkStyle default stroke:#666,stroke-width:2.5px
-```
-
-## Environment / constraints
-- GPU: 2x GTX TITAN X (12GB). Default device: **`cuda:0`**
-- Venv: `/scratch/kk6081/ml_fall25/venv/`
-- Artifacts/checkpoints: **`/scratch/kk6081/picollm_extend/`**
-
-## TL;DR (quick start commands)
-
-### Recommended: Orca-Math Base → GSM8K for Best Results ⭐
+## Quick Start
 
 ```bash
-source /scratch/kk6081/ml_fall25/venv/bin/activate
-cd /home/kk6081/pico_llm_extend/pico-llm
+# 1. Train base model on Orca-Math (~8-10 hours)
+bash scripts/train.sh orca
 
-# 1) Train on Orca-Math (200k math word problems, 100k subset) - 8-10 hours
-EPOCHS=8 MAX_SAMPLES=100000 bash scripts/train_transformer_orca.sh
+# 2. Fine-tune on GSM8K with RL (~12-14 hours, auto-detects checkpoint)
+bash scripts/train.sh gsm8k
 
-# 2) Train on GSM8K with RL - 12-14 hours
-BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_epoch8.pt" \
-  EPOCHS=10 LR=5e-4 RUN_RL=1 \
-  bash scripts/train_transformer_gsm8k.sh
-
-# 3) Evaluate
-python scripts/eval_reasoning.py
-
-# Expected: 45-60% GSM8K accuracy with MEDIUM model!
+# 3. Evaluate
+python scripts/evaluation/eval_reasoning.py \
+  --checkpoint /scratch/kk6081/picollm_extend/gsm8k_transformer_epoch8.pt
 ```
 
-### Quick Evaluation & Interpretability
+### Model Sizes
+
+| Size | Parameters | Memory | Fits on GTX TITAN X (12GB) |
+|------|-----------|--------|---------------------------|
+| `small` | 10M | ~2GB | ✅ Yes |
+| `medium` (default) | 40M | ~4GB | ✅ Yes |
+| `gpt2-small` | 117M | ~8GB | ✅ Yes (tight) |
+
+**Recommended for your hardware:** `small`, `medium`, or `gpt2-small` with reduced batch size.
 
 ```bash
-# Evaluate GSM8K accuracy
-python scripts/eval_reasoning.py \
-  --checkpoint /scratch/kk6081/picollm_extend/transformer_gsm8k_rl.pt \
-  --data data/gsm8k_test.txt
+# Train with gpt2-small (max for 12GB GPU)
+BATCH=8 TRANSFORMER_SIZE=gpt2-small bash scripts/train.sh orca
+```
 
-# Interpretability analysis
-python scripts/interpret_transformer.py \
-  --checkpoint /scratch/kk6081/picollm_extend/transformer_finemath_epoch5.pt \
+## Configuration
+
+You can control training parameters using environment variables:
+
+```bash
+# Model & Data
+TRANSFORMER_SIZE=medium          # small, medium, gpt2-*
+MAX_SAMPLES=100000              # Orca-Math examples to use
+
+# Training
+BATCH=16                        # Batch size (reduce if OOM)
+EPOCHS=8                        # Number of epochs
+LR=3e-4                         # Learning rate
+DEVICE=cuda:0                   # GPU device
+
+# Example: Train larger model with more epochs
+TRANSFORMER_SIZE=gpt2-small EPOCHS=10 bash scripts/train.sh orca
+```
+
+## Training Modes
+
+The unified `scripts/train.sh` handles all training workflows:
+
+```bash
+# Base training on Orca-Math
+bash scripts/train.sh orca [model_size]
+
+# Fine-tune on GSM8K (auto-detects latest checkpoint)
+bash scripts/train.sh gsm8k [model_size]
+
+# Train GPT-2 models
+bash scripts/train.sh gpt2 [gpt2-small|gpt2-medium|gpt2-large|gpt2-xl]
+```
+
+### RL Refinement
+
+GSM8K training includes RL refinement by default:
+- Best-of-n sampling (generates 8 solutions per problem)
+- Outcome-based rewards (correct answer gets positive reward)
+- Runs for 400 steps after supervised training
+
+```bash
+# Skip RL refinement
+RUN_RL=0 bash scripts/train.sh gsm8k
+
+# More RL steps
+RL_STEPS=600 bash scripts/train.sh gsm8k
+```
+
+## Interpretability
+
+Analyze attention patterns, neuron activations, and internal representations:
+
+```bash
+# Generate interpretability data
+python scripts/utils/interpret_transformer.py \
+  --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch8.pt \
   --analysis attention,logit_lens,neurons \
-  --out_dir /scratch/kk6081/picollm_extend/interpretability \
-  --embed_size 512 --transformer_heads 8 --transformer_blocks 6 --ff_mult 4 \
-  --test_prompts "Problem: If x + 5 = 12, then x =" \
-  --device cuda:0
+  --out_dir /scratch/kk6081/picollm_extend/interpretability
 
-# View interpretability results in browser
-python scripts/interpretability_viewer.py \
+# View results in browser
+python scripts/utils/interpretability_viewer.py \
   --root /scratch/kk6081/picollm_extend/interpretability \
-  --host 127.0.0.1 --port 8000
-```
-
-## 📚 Key Concepts
-
-### Why Orca-Math Base?
-
-**Orca-Math base** provides clean mathematical reasoning patterns ideal for math tasks:
-- ✅ **Step-by-step solutions**: Clear explanations build strong reasoning chains
-- ✅ **Math vocabulary**: Natural phrases like "Let's calculate...", "Therefore...", "We can solve..."
-- ✅ **Natural transfer**: Math word problems → GSM8K word problems (same domain)
-- ✅ **High quality**: Microsoft-curated 200k dataset with verified solutions
-- ✅ **Clean format**: Q&A pairs without narrative artifacts or repetition
-
-### Expected Results
-
-| Base Model | GSM8K Accuracy | Training Time | Notes |
-|------------|----------------|---------------|-------|
-| **Orca-Math** | **45-60%** | 20-24 hours | Clean word problems ⭐ |
-
-### Datasets Used
-
-- **Orca-Math-Word-Problems-200k** (base): 100k clean math word problems from Microsoft
-- **GSM8K** (finetuning): 7.3k grade school math word problems
-- **RL refinement**: Best-of-n sampling for answer selection
-
-## 🚀 Quick Start: Apply Training Patches (RECOMMENDED)
-
-**Before your first training run**, apply stability patches for 30-50% faster convergence:
-
-```bash
-# 1. Preview what will be changed (safe, no modifications)
-python scripts/training_stability_patch.py --dry-run
-
-# 2. Apply patches to pico-llm.py (creates backup automatically)
-python scripts/training_stability_patch.py --apply
-
-# 3. Train as normal - patches are now active!
-bash scripts/train_transformer_fast.sh
-```
-
-**What gets patched**:
-- ✅ **GPT-2 style weight initialization** - prevents exploding/vanishing gradients
-- ✅ **Improved AdamW settings** - better convergence (beta2=0.95, weight_decay=0.1)
-- ✅ **Gradient norm monitoring** - detect instability early (logs grad_norm in training)
-- ✅ **Early stopping** - saves best checkpoint, stops if validation loss plateaus
-
-**Verification**: After applying, your training logs will show:
-```
-[transformer] Epoch 1/3, Step 20/200 (global step: 20) Loss: 4.2341, Grad_norm: 2.156, LR: 1.50e-04
-```
-
-If you see `Grad_norm` and `LR` in logs → patches are active! ✅
-
-**Rollback if needed**:
-```bash
-# Restore original (backup created automatically)
-cp pico-llm.py.backup pico-llm.py
-```
-
-📖 **For advanced techniques** (mixed precision, gradient accumulation, LLRD), see: **[TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md)**
-
----
-
-## Training
-
-### 🎯 One-Command Full Pipeline (NEW!)
-
-For the complete Orca-Math → GSM8K workflow in one command:
-
-```bash
-# Complete pipeline: Download data + Base training + GSM8K finetuning
-bash scripts/full_pipeline_orca.sh
-```
-
-This script will:
-1. Download 100k Orca-Math word problems (from 200k available)
-2. Train base transformer (8 epochs, ~8-10 hours)
-3. Guide you through GSM8K fine-tuning setup
-
-**Manual control** (if you prefer step-by-step):
-
-```bash
-# Step 1: Download Orca-Math data
-python3 scripts/prepare_orca_math_data.py --max_samples 100000
-
-# Step 2: Base training
-bash scripts/train_transformer_orca.sh
-
-# Step 3: GSM8K fine-tuning
-BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_epoch8.pt" \
-  EPOCHS=10 LR=5e-4 RUN_RL=1 \
-  bash scripts/train_transformer_gsm8k.sh
-```
-
-### Base Transformer Training
-
-**Orca-Math (RECOMMENDED)** - Microsoft's 200k math word problems
-- Command: `bash scripts/train_transformer_orca.sh`
-- ✅ **Best for**: GSM8K and any math word problem tasks
-- ✅ **Clean transfer**: Step-by-step solutions naturally transfer to GSM8K
-- ✅ **High quality**: Curated dataset with verified solutions
-
-Scaling knobs (see `pico-llm.py`):
-- `--transformer_size {small,medium}`
-- Faster training knobs: `--sample_interval_seconds`, `--sample_every_steps`, `--lr_schedule`, `--lr_warmup_steps`, `--lr_min_ratio`
-
-If you hit OOM on 12GB GPU:
-- `BATCH=8` (or `4`) and/or `TRANSFORMER_SIZE=small`
-
-### Training Parameters
-
-Environment variables to control training (work with all training scripts):
-```bash
-# Model architecture
-TRANSFORMER_SIZE=medium          # small (384d, 4h, 3b) or medium (512d, 8h, 6b)
-MAX_SAMPLES=100000              # Number of Orca-Math examples (from 200k available)
-
-# Training hyperparameters
-BATCH=16                         # Batch size (reduce to 8 or 4 if OOM)
-EPOCHS=8                         # Number of epochs (8 for Orca-Math base)
-LR=3e-4                          # Learning rate (3e-4 for Orca-Math)
-VAL_SPLIT=0.05                   # Validation split (0.05 = 5%)
-
-# LR scheduling
-LR_SCHEDULE=cosine               # none, cosine, or linear
-LR_WARMUP_STEPS=1000             # Warmup steps for stability
-LR_MIN_RATIO=0.2                 # Min LR as fraction of base LR
-
-# Sampling/logging
-SAMPLE_EVERY_STEPS=0             # Generate text every N steps (0=time-based)
-SAMPLE_INTERVAL_SECONDS=300      # Or every N seconds (default: 5 minutes)
-```
-
-**Example**: Train medium model with larger batch
-```bash
-TRANSFORMER_SIZE=medium BATCH=32 LR=3e-4 bash scripts/train_transformer_fast.sh
-```
-
-### 🔧 Advanced: Manual Training Improvements
-
-If you want more control beyond the automatic patch, see **[TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md)** for:
-- **Gradient accumulation** - simulate larger batch sizes (effective batch = BATCH × ACCUM_STEPS)
-- **Mixed precision training (FP16)** - 2x faster, 50% less memory
-- **Layer-wise learning rate decay (LLRD)** - for finetuning only
-- **Dropout strategies** - prevent overfitting
-- **Curriculum learning** - start with easier examples
-- **Troubleshooting guide** - fix loss explosions, plateaus, overfitting
-
-## GSM8K Math Reasoning Training
-
-### Step-by-Step Guide
-
-**1. Prepare GSM8K Data** (automatic, runs on first training):
-```bash
-bash scripts/prepare_hf_gsm8k_data.sh
-```
-Downloads GSM8K dataset from HuggingFace and creates:
-- `data/gsm8k_train.txt` (7,324 examples)
-- `data/gsm8k_val.txt` (split from train)
-- `data/gsm8k_test.txt` (1,319 examples)
-
-**2. Train on GSM8K**:
-```bash
-# With FineMath base (recommended)
-BASE_CKPT="/scratch/kk6081/picollm_extend/transformer_finemath_epoch5.pt" \
-  EPOCHS=10 LR=5e-4 RUN_RL=1 \
-  bash scripts/train_transformer_gsm8k.sh
-```
-
-**3. Evaluate**:
-```bash
-python scripts/eval_reasoning.py \
-  --checkpoint /scratch/kk6081/picollm_extend/transformer_gsm8k_rl.pt \
-  --data data/gsm8k_test.txt
-```
-
-### Training Configuration
-
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| `EPOCHS` | 8 | Use 10 for better results |
-| `LR` | 3e-4 | Standard for Orca-Math base |
-| `RUN_RL` | 1 | Set to 0 to skip RL refinement |
-| `RL_STEPS` | 400 | RL refinement iterations |
-| `RL_BATCH` | 12 | Batch size for RL |
-| `RL_NUM_SAMPLES` | 8 | Best-of-n samples per problem |
-
-**Override examples**:
-```bash
-# Quick test (no RL, 1 epoch)
-EPOCHS=1 RUN_RL=0 bash scripts/train_transformer_gsm8k.sh
-
-# Extended training (15 epochs + RL)
-EPOCHS=15 RUN_RL=1 RL_STEPS=600 bash scripts/train_transformer_gsm8k.sh
-```
-
-### Understanding RL Refinement
-
-After supervised finetuning (SFT), RL refinement improves answer selection:
-1. Generate `N` candidate solutions per problem (best-of-n sampling)
-2. Score solutions based on correct final answer
-3. Update model to prefer correct reasoning paths
-
-**Reading**:
-- [DeepSeek-R1 paper](https://arxiv.org/abs/2501.12948) - RL for reasoning
-- [Dr. Tulu draft](https://www.datocms-assets.com/64837/1763496622-dr_tulu_draft.pdf) - Outcome supervision
-
-## Interpretability & analysis
-
-Tool: `scripts/interpret_transformer.py` (attention heatmaps, logit lens, neuron max-activation contexts, patching stub).
-
-### Web UI (browse saved results)
-
-After you generate results with `interpret_transformer.py`, you can browse them with a lightweight local web UI:
-
-```bash
-python scripts/interpretability_viewer.py \
-  --root /scratch/kk6081/picollm_extend/interpretability_test \
-  --host 127.0.0.1 --port 8000
-```
-
-Then open: `http://127.0.0.1:8000/`
-
-Transformer Circuits hub:
-- https://transformer-circuits.pub/
-
-Referenced posts:
-- Framework: https://transformer-circuits.pub/2021/framework/index.html
-- Induction heads: https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html
-- Monosemantic features: https://transformer-circuits.pub/2023/monosemantic-features/index.html
-- Toy models of superposition: https://transformer-circuits.pub/2022/toy_model/index.html
-
-Example:
-
-```bash
-python scripts/interpret_transformer.py \
-  --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch1.pt \
-  --analysis attention,logit_lens,neurons \
-  --out_dir /scratch/kk6081/picollm_extend/interpretability_test \
-  --embed_size 384 --transformer_heads 4 --transformer_blocks 3 --ff_mult 2 \
-  --test_prompts "Once upon a time" "2 + 2 =" \
-  --device cuda:0
+  --port 8000
 ```
 
 Outputs:
-- `attention/attn_*.png` - Attention heatmaps per layer/head
-- `logit_lens/results.json` - Token predictions at each layer
-- `neurons/top_neurons.json` - Max-activating contexts for FF neurons
-- `summary.json` - Analysis metadata
+- Attention heatmaps per layer/head
+- Logit lens (token predictions at each layer)
+- Top neurons with max-activating contexts
 
----
+Inspired by [Transformer Circuits](https://transformer-circuits.pub/)
 
-## 📁 Repository Structure
+## Repository Structure
 
-### Training Scripts
-- `train_transformer_orca.sh` ⭐ - Train base model on Orca-Math (math-focused)
-- `train_transformer_gsm8k.sh` - GSM8K finetuning + optional RL
-- `full_pipeline_orca.sh` - Complete pipeline (Orca-Math → GSM8K → RL)
+```
+pico-llm/
+├── pico-llm.py              # Main training script
+├── inference.py             # Text generation
+├── plot_losses.py           # Visualize training curves
+├── scripts/
+│   ├── train.sh            # Unified training script (orca/gsm8k/gpt2)
+│   ├── data_prep/          # Dataset preparation
+│   │   ├── prepare_orca_math_data.py
+│   │   └── prepare_hf_gsm8k_data.sh
+│   ├── evaluation/         # Model evaluation
+│   │   ├── eval_reasoning.py
+│   │   └── rl_reasoning_outcome.py
+│   └── utils/              # Utilities
+│       ├── check_checkpoint_arch.py
+│       ├── interpret_transformer.py
+│       └── interpretability_viewer.py
+└── data/                   # Training data (auto-downloaded)
+```
 
-### Data Preparation
-- `prepare_orca_math_data.py` - Download Orca-Math-Word-Problems-200k from HuggingFace
-- `prepare_hf_gsm8k_data.sh` - Download GSM8K from HuggingFace
+## Additional Resources
 
-### Evaluation & Analysis
-- `eval_reasoning.py` - Evaluate GSM8K accuracy
-- `interpret_transformer.py` - Attention/neuron analysis
-- `interpretability_viewer.py` - Web UI for interpretability results
-- `rl_reasoning_outcome.py` - RL refinement script (called by train_transformer_gsm8k.sh)
-
-### Utilities
-- `check_checkpoint_arch.py` - Inspect checkpoint architecture
-- `training_stability_patch.py` - Apply training improvements to pico-llm.py
-
-### Core
-- `pico-llm.py` - Main training script (Transformer + LSTM implementations)
-- `inference.py` - Generate text from trained models
-- `plot_losses.py` - Visualize training curves
-
----
-
-## 🎯 Quick Reference Card
-
-| Task | Command | Time |
-|------|---------|------|
-| **Full pipeline** | `bash scripts/full_pipeline_orca.sh` | 20-24h |
-| **Math base training** | `bash scripts/train_transformer_orca.sh` | 8-10h |
-| **GSM8K training** | `BASE_CKPT=... bash scripts/train_transformer_gsm8k.sh` | 12-14h |
-| **Evaluate GSM8K** | `python scripts/eval_reasoning.py --checkpoint ... --data data/gsm8k_test.txt` | 5-10m |
-| **Interpretability** | `python scripts/interpret_transformer.py --checkpoint ...` | 2-5m |
-| **View results** | `python scripts/interpretability_viewer.py --root ...` | instant |
-
-**Total time for best model**: ~20-24 hours (Orca-Math base + GSM8K + RL)
+- **Quick reference**: See `QUICKSTART.txt` for common commands
+- **Datasets**: Orca-Math-200k, GSM8K
+- **Inspiration**: [Transformer Circuits](https://transformer-circuits.pub/), [DeepSeek-R1](https://arxiv.org/abs/2501.12948)
 

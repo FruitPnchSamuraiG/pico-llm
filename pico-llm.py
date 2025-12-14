@@ -2,6 +2,8 @@ import argparse
 import time
 import random 
 import math
+import os
+import pickle
 import torch
 import torch.nn as nn
 import torch.optim as optim 
@@ -85,16 +87,20 @@ def parse_args():
         "--transformer_size",
         type=str,
         default="small",
-        choices=["small", "medium"],
+        choices=["small", "medium", "gpt2-small", "gpt2-medium", "gpt2-large", "gpt2-xl"],
         help=(
             "Convenience preset that sets embed_size/heads/blocks/ff_mult. "
-            "Overrides individual flags if provided. small=384/4/3/2, medium=512/8/6/4."
+            "Overrides individual flags if provided. "
+            "small=384/4/3/2 (~10M, ~2GB), medium=512/8/6/4 (~40M, ~4GB), "
+            "gpt2-small=768/12/12/4 (117M, ~8GB), gpt2-medium=1024/16/24/4 (345M, ~16GB), "
+            "gpt2-large=1280/20/36/4 (774M, ~32GB), gpt2-xl=1600/25/48/4 (1.5B, ~64GB). "
+            "For GTX TITAN X (12GB): Use small, medium, or gpt2-small (with reduced batch)."
         ),
     )
 
     # Training stability and quality improvements
-    # parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm. Prevents exploding gradients.")
-    # parser.add_argument("--weight_decay", type=float, default=0.01, help="L2 regularization weight decay for AdamW.")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm. Prevents exploding gradients.")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="L2 regularization weight decay for AdamW.")
     
     # Validation split
     parser.add_argument("--val_split", type=float, default=0.1, help="Fraction of data to use for validation (0.1 = 10 percent)")
@@ -161,6 +167,30 @@ def parse_args():
         args.embed_size = 512
         args.transformer_heads = 8
         args.transformer_blocks = 6
+        args.ff_mult = 4
+    elif args.transformer_size == "gpt2-small":
+        # GPT-2 Small: 117M parameters
+        args.embed_size = 768
+        args.transformer_heads = 12
+        args.transformer_blocks = 12
+        args.ff_mult = 4
+    elif args.transformer_size == "gpt2-medium":
+        # GPT-2 Medium: 345M parameters
+        args.embed_size = 1024
+        args.transformer_heads = 16
+        args.transformer_blocks = 24
+        args.ff_mult = 4
+    elif args.transformer_size == "gpt2-large":
+        # GPT-2 Large: 774M parameters
+        args.embed_size = 1280
+        args.transformer_heads = 20
+        args.transformer_blocks = 36
+        args.ff_mult = 4
+    elif args.transformer_size == "gpt2-xl":
+        # GPT-2 XL: 1.5B parameters
+        args.embed_size = 1600
+        args.transformer_heads = 25
+        args.transformer_blocks = 48
         args.ff_mult = 4
 
     return args
@@ -740,7 +770,7 @@ def nucleus_sampling(logits, p=0.95):
 
     # Find cutoff: smallest set with cumulative mass >= p
     cutoff_idx = torch.searchsorted(cumulative, torch.tensor(p, device=logits.device))
-    cutoff_idx = torch.clamp(cutoff_idx, min=1)  # Ensure at least 1 token (avoid empty nucleus)
+    cutoff_idx = torch.clamp(cutoff_idx, min=1, max=len(sorted_probs))  # Ensure valid range
 
     # Extract nucleus (top tokens within threshold)
     kept_probs = sorted_probs[:cutoff_idx]
@@ -750,8 +780,12 @@ def nucleus_sampling(logits, p=0.95):
     kept_probs = kept_probs / kept_probs.sum()
     
     # Sample from nucleus
-    sampled_pos = torch.multinomial(kept_probs, num_samples=1).item()
-    return kept_indices[sampled_pos].item() # type: ignore
+    sampled_pos = int(torch.multinomial(kept_probs, num_samples=1).item())
+    chosen_idx = int(kept_indices[sampled_pos].item())
+    
+    # Safety: clamp to valid vocab range
+    vocab_size = logits.shape[0]
+    return int(max(0, min(chosen_idx, vocab_size - 1)))
 
 
 def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
@@ -813,12 +847,16 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
             next_logits = logits_seq[-1, 0, :]  # (vocab_size,)
 
             # Sample next token
+            vocab_size = enc.n_vocab
             if top_p is None:
                 # Greedy decoding: always pick most likely token
-                chosen_token = torch.argmax(next_logits).item()
+                chosen_token = int(torch.argmax(next_logits).item())
             else:
                 # Nucleus sampling: sample from top-p probability mass
                 chosen_token = nucleus_sampling(next_logits, p=top_p)
+
+            # Clamp token to valid vocab range (prevents !!!!! errors)
+            chosen_token = max(0, min(chosen_token, vocab_size - 1))
 
             # Append to context
             context_tokens.append(chosen_token)
@@ -998,6 +1036,9 @@ def train_one_model(model,
             # Backward pass: compute gradients
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             
             # Update model parameters
             optimizer.step()
@@ -1335,6 +1376,8 @@ def main():
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
             prompt=args.prompt,
+            grad_clip=args.grad_clip,
+            weight_decay=args.weight_decay,
             val_loader=val_loader,
             checkpoint_dir=checkpoint_dir,
             lr_schedule=args.lr_schedule,
