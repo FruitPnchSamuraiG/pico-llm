@@ -37,7 +37,7 @@ EPOCHS=${EPOCHS:-8}
 LR=${LR:-3e-4}
 BLOCK_SIZE=${BLOCK_SIZE:-256}
 VAL_SPLIT=${VAL_SPLIT:-0.05}
-MAX_SAMPLES=${MAX_SAMPLES:-100000}
+MAX_SAMPLES=${MAX_SAMPLES:-0}  # 0 = use all available data (no limit)
 
 # LR scheduling
 LR_SCHEDULE=${LR_SCHEDULE:-cosine}
@@ -219,8 +219,9 @@ train_orca() {
   echo ""
 }
 
-train_gsm8k() {
-  print_header "🧮 Fine-tuning on GSM8K"
+train_gsm8k_only() {
+  print_header "🧮 Training on GSM8K from Scratch (SFT + RL)"
+  print_config
   
   prepare_gsm8k_data
   
@@ -242,13 +243,124 @@ train_gsm8k() {
       ;;
   esac
   
-  # Auto-detect base checkpoint
+  local vram=$(estimate_vram "$TRANSFORMER_SIZE")
+  echo "Model: $TRANSFORMER_SIZE (estimated VRAM: $vram)"
+  echo ""
+  
+  # Check GSM8K data
+  local train_count=$(wc -l < "$DATA_DIR/gsm8k_train.txt")
+  local val_count=$(wc -l < "$DATA_DIR/gsm8k_val.txt")
+  echo "✓ GSM8K data ready:"
+  echo "  Train: $train_count examples"
+  echo "  Val:   $val_count examples"
+  echo ""
+  
+  local prompt="Q: If you have 3 apples and buy 2 more, how many apples do you have? A:"
+  
+  print_header "🚀 Stage 1: Supervised Fine-tuning (from scratch)"
+  python pico-llm.py \
+    --enable_transformer --disable_lstm \
+    --device_id "$DEVICE" \
+    --checkpoint_dir "$OUTDIR" \
+    --input_files "$DATA_DIR/gsm8k_train.txt" \
+    --tinystories_weight 0.0 \
+    --batch_size "$BATCH" \
+    --num_epochs "$EPOCHS" \
+    --block_size "$BLOCK_SIZE" \
+    --transformer_size "$TRANSFORMER_SIZE" \
+    --learning_rate "$LR" \
+    --val_split "$VAL_SPLIT" \
+    --prompt "$prompt" \
+    --grad_clip "$GRAD_CLIP" \
+    --weight_decay "$WEIGHT_DECAY" \
+    --sample_interval_seconds "$SAMPLE_INTERVAL_SECONDS" \
+    --sample_every_steps "$SAMPLE_EVERY_STEPS" \
+    --lr_schedule "$LR_SCHEDULE" \
+    --lr_warmup_steps "$LR_WARMUP_STEPS" \
+    --lr_min_ratio "$LR_MIN_RATIO"
+  
+  # Find latest SFT checkpoint
+  local sft_ckpt=$(find_latest_checkpoint)
+  if [[ -z "$sft_ckpt" ]]; then
+    echo "❌ No SFT checkpoint produced"
+    exit 1
+  fi
+  
+  echo "✅ SFT complete: $sft_ckpt"
+  
+  # Optional RL stage
+  if [[ "$RUN_RL" == "1" ]]; then
+    local rl_dir="$OUTDIR/rl_gsm8k"
+    mkdir -p "$rl_dir"
+    
+    print_header "🚀 Stage 2: RL Outcome Training"
+    echo "Steps: $RL_STEPS, Batch: $RL_BATCH, Samples: $RL_NUM_SAMPLES"
+    echo "LR: $RL_LR, Max tokens: $RL_MAX_NEW_TOKENS"
+    echo ""
+    
+    python scripts/evaluation/rl_reasoning_outcome.py \
+      --init_from "$sft_ckpt" \
+      --train_data "$DATA_DIR/gsm8k_train.txt" \
+      --val_data "$DATA_DIR/gsm8k_val.txt" \
+      --out_dir "$rl_dir" \
+      --device "$DEVICE" \
+      --block_size "$BLOCK_SIZE" \
+      --num_steps "$RL_STEPS" \
+      --batch_size "$RL_BATCH" \
+      --num_samples "$RL_NUM_SAMPLES" \
+      --max_new_tokens "$RL_MAX_NEW_TOKENS" \
+      --lr "$RL_LR"
+    
+    if [[ -f "$rl_dir/transformer_rl_reasoning.pt" ]]; then
+      cp -f "$rl_dir/transformer_rl_reasoning.pt" "$OUTDIR/gsm8k_rl.pt"
+      echo "✅ RL complete: $OUTDIR/gsm8k_rl.pt"
+    fi
+  fi
+  
+  print_header "✅ GSM8K Training Complete!"
+  echo "Checkpoints:"
+  echo "  SFT: $OUTDIR/transformer_epoch*.pt"
+  [[ "$RUN_RL" == "1" ]] && echo "  RL:  $OUTDIR/gsm8k_rl.pt"
+  echo ""
+  echo "Evaluate with:"
+  echo "  python scripts/evaluation/eval_reasoning.py \\"
+  echo "    --checkpoint $OUTDIR/transformer_epoch${EPOCHS}.pt \\"
+  echo "    --device $DEVICE"
+  echo ""
+}
+
+train_gsm8k() {
+  print_header "🧮 Fine-tuning on GSM8K (from base checkpoint)"
+  
+  prepare_gsm8k_data
+  
+  # Hardware check
+  case "$TRANSFORMER_SIZE" in
+    gpt2-small)
+      if [ "$BATCH" -gt 8 ]; then
+        echo "⚠️  WARNING: gpt2-small with batch=$BATCH may exceed 12GB VRAM"
+        BATCH=8
+        echo "   Auto-adjusted to BATCH=8 for GTX TITAN X"
+        echo ""
+      fi
+      ;;
+    gpt2-medium|gpt2-large|gpt2-xl)
+      echo "❌ ERROR: $TRANSFORMER_SIZE requires >12GB VRAM"
+      echo "   Your GPUs: 2x GTX TITAN X (12GB each)"
+      echo ""
+      exit 1
+      ;;
+  esac
+  
+  # Auto-detect base checkpoint (optional for backward compatibility)
   if [[ -z "${BASE_CKPT:-}" ]]; then
     BASE_CKPT=$(find_latest_checkpoint)
     if [[ -z "$BASE_CKPT" ]]; then
-      echo "❌ No base checkpoints found in $OUTDIR/transformer_epoch*.pt"
-      echo "   Run 'bash scripts/train.sh orca' first to create a base checkpoint"
-      exit 1
+      echo "⚠️  No base checkpoints found in $OUTDIR/transformer_epoch*.pt"
+      echo "   Training from scratch on GSM8K (use 'gsm8k-sft' mode explicitly for clarity)"
+      echo ""
+      train_gsm8k_only
+      return
     fi
     local epoch_num=$(basename "$BASE_CKPT" .pt | sed 's/transformer_epoch//')
     echo "✓ Auto-detected base checkpoint: $BASE_CKPT (epoch $epoch_num)"
@@ -323,7 +435,7 @@ train_gsm8k() {
     echo "LR: $RL_LR, Max tokens: $RL_MAX_NEW_TOKENS"
     echo ""
     
-    python scripts/rl_reasoning_outcome.py \
+    python scripts/evaluation/rl_reasoning_outcome.py \
       --init_from "$sft_ckpt" \
       --train_data "$DATA_DIR/gsm8k_train.txt" \
       --val_data "$DATA_DIR/gsm8k_val.txt" \
@@ -342,13 +454,13 @@ train_gsm8k() {
     fi
   fi
   
-  print_header "✅ GSM8K Training Complete!"
+  print_header "✅ GSM8K Fine-tuning Complete!"
   echo "Checkpoints:"
   echo "  SFT: $OUTDIR/gsm8k_transformer_epoch*.pt"
   [[ "$RUN_RL" == "1" ]] && echo "  RL:  $OUTDIR/gsm8k_rl.pt"
   echo ""
   echo "Evaluate with:"
-  echo "  python scripts/eval_reasoning.py \\"
+  echo "  python scripts/evaluation/eval_reasoning.py \\"
   echo "    --checkpoint $OUTDIR/gsm8k_transformer_epoch${EPOCHS}.pt \\"
   echo "    --device $DEVICE"
   echo ""
@@ -371,38 +483,54 @@ case "$MODE" in
     fi
     train_orca
     ;;
+  gsm8k-sft|gsm8k-only|sft)
+    # Train from scratch on GSM8K only (no Orca-Math)
+    train_gsm8k_only
+    ;;
   gsm8k|finetune)
+    # Fine-tune on GSM8K from base checkpoint (backward compatible)
     train_gsm8k
     ;;
   *)
-    echo "Usage: bash scripts/train.sh [orca|gsm8k|gpt2] [options]"
+    echo "Usage: bash scripts/train.sh [MODE] [options]"
     echo ""
-    echo "Modes:"
-    echo "  orca    - Train base model on Orca-Math dataset"
-    echo "  gsm8k   - Fine-tune on GSM8K (requires base checkpoint)"
-    echo "  gpt2    - Train GPT-2 scale model (specify size as 2nd arg)"
+    echo "🎯 GSM8K-Only Modes (NO Orca-Math):"
+    echo "  gsm8k-sft   - Train from scratch on GSM8K (SFT + optional RL)"
+    echo "  gsm8k-only  - Alias for gsm8k-sft"
+    echo "  sft         - Alias for gsm8k-sft"
     echo ""
-    echo "Examples:"
+    echo "📚 Other Modes:"
+    echo "  orca        - Train base model on Orca-Math dataset"
+    echo "  gsm8k       - Fine-tune on GSM8K (auto-detects base checkpoint or trains from scratch)"
+    echo "  gpt2        - Train GPT-2 scale model on Orca-Math (specify size as 2nd arg)"
+    echo ""
+    echo "💡 Examples:"
+    echo "  # Train on GSM8K only (most common for your use case)"
+    echo "  bash scripts/train.sh gsm8k-sft"
+    echo "  bash scripts/train.sh gsm8k-sft gpt2-small"
+    echo ""
+    echo "  # Train with custom settings"
+    echo "  EPOCHS=12 BATCH=8 bash scripts/train.sh gsm8k-sft"
+    echo "  RUN_RL=0 bash scripts/train.sh gsm8k-sft  # Skip RL stage"
+    echo ""
+    echo "  # Other modes (with Orca-Math)"
     echo "  bash scripts/train.sh orca                    # Train medium model"
-    echo "  bash scripts/train.sh orca small              # Train small model"
-    echo "  bash scripts/train.sh gpt2 gpt2-small         # Train GPT-2 Small (max for 12GB)"
-    echo "  bash scripts/train.sh gsm8k                   # Fine-tune on GSM8K"
-    echo "  EPOCHS=10 bash scripts/train.sh orca          # Train for 10 epochs"
+    echo "  bash scripts/train.sh gpt2 gpt2-small         # Train GPT-2 Small"
     echo ""
-    echo "Environment variables:"
-    echo "  TRANSFORMER_SIZE  - Model size (small/medium/gpt2-small)"
+    echo "🔧 Environment Variables:"
+    echo "  TRANSFORMER_SIZE  - Model size (small/medium/gpt2-small, default: medium)"
     echo "  BATCH            - Batch size (default: 16, auto 8 for gpt2-small)"
     echo "  EPOCHS           - Number of epochs (default: 8)"
     echo "  LR               - Learning rate (default: 3e-4)"
     echo "  GRAD_CLIP        - Gradient clipping norm (default: 1.0)"
     echo "  WEIGHT_DECAY     - AdamW weight decay (default: 0.01)"
     echo "  DEVICE           - Device (default: cuda:0)"
-    echo "  BASE_CKPT        - Base checkpoint for GSM8K mode"
     echo "  RUN_RL           - Run RL stage for GSM8K (default: 1)"
+    echo "  BASE_CKPT        - Base checkpoint for gsm8k mode"
     echo ""
-    echo "Hardware: 2x GTX TITAN X (12GB VRAM each)"
-    echo "Supported models: small, medium, gpt2-small"
-    echo "Not supported: gpt2-medium/large/xl (require >12GB VRAM)"
+    echo "💻 Hardware: 2x GTX TITAN X (12GB VRAM each)"
+    echo "  ✅ Supported: small, medium, gpt2-small"
+    echo "  ❌ Not supported: gpt2-medium/large/xl (require >12GB VRAM)"
     echo ""
     exit 1
     ;;

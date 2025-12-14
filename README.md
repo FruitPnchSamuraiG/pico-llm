@@ -4,14 +4,126 @@ A small transformer for math reasoning, trained on Orca-Math and fine-tuned on G
 
 Includes interpretability tools for analyzing attention patterns and neuron activations. Supports models from 10M to 1.5B parameters.
 
-## Quick Start
+---
+
+## 🎯 New: Complete 3-Stage Training Pipeline
+
+This repository now includes a **complete 3-stage training pipeline** for building GSM8K reasoning models with preference-based post-training (DPO/GRPO).
+
+> Note: In many production stacks, DPO is trained on *human preference pairs* or a reward model.
+> Here, Stage 3 constructs **synthetic preferences from GSM8K answer correctness** (an automatic verifier), i.e. **RLAIF-style**.
+
+### 📊 Pipeline Architecture (Mermaid)
+
+```mermaid
+flowchart TD
+    A([Start]) --> B{Do you already have an Orca checkpoint?\ntransformer_epoch*.pt}
+
+    %% Stage 1
+    B -- "No" --> S1["Stage 1: Orca-Math Base Training\nDataset: Orca-Math (~200k)\nMethod: SFT (cross-entropy)\nOutput: transformer_epoch8.pt\nTime: ~8-12h"]
+    S1 --> S2
+
+    %% Skip Stage 1
+    B -- "Yes" --> S2
+
+    %% Stage 2
+    S2["Stage 2: GSM8K Supervised Fine-Tuning\nDataset: GSM8K train\nMethod: SFT from Orca base\nOutput: gsm8k_transformer_epoch8.pt\nTime: ~2-3h"] --> C{Choose post-training algorithm}
+
+    %% Stage 3
+    C -->|DPO| DPO["Stage 3A: DPO (synthetic preferences)\nDirect Preference Optimization\nSamples: 2 per prompt\nTime: ~1-2h\nOutput: transformer_dpo_final.pt"]
+    C -->|GRPO| GRPO["Stage 3B: GRPO (outcome reward)\nGroup Relative Policy Optimization\nSamples: 4-16 per prompt\nTime: ~2-3h\nOutput: transformer_grpo_final.pt"]
+
+    DPO --> F([Final GSM8K Reasoning Model])
+    GRPO --> F
+
+    F --> E["Evaluate\npython scripts/evaluation/eval_reasoning.py\n--checkpoint <final_model>\n--test_file data/gsm8k_test.txt"]
+```
+
+### 🚀 Quick Start (One Command)
+
+```bash
+# Run complete pipeline (skip Stage 1 if Orca checkpoint already exists)
+SKIP_STAGE1=1 bash scripts/full_pipeline_gsm8k.sh dpo medium
+
+# Or use GRPO (group-based policy optimization)
+SKIP_STAGE1=1 bash scripts/full_pipeline_gsm8k.sh grpo medium
+
+# Non-interactive / remote (no confirmation prompt)
+YES=1 SKIP_STAGE1=1 bash scripts/full_pipeline_gsm8k.sh dpo medium
+```
+
+**This will**:
+- ✅ Skip Stage 1 (Orca - already trained)
+- 🔄 Run Stage 2 (GSM8K SFT) → ~2-3 hours
+- 🔄 Run Stage 3 (DPO/GRPO, RLAIF-style) → ~1-3 hours
+- ✅ Output final reasoning model
+
+**Total time**: ~3-6 hours on GTX TITAN X
+
+### 🧭 How to start post-training (Stage 3)
+
+Post-training (DPO/GRPO) assumes you already have a **GSM8K SFT checkpoint** from Stage 2.
+
+1) **Run Stage 2 (GSM8K SFT)** (recommended: disable the legacy RL refinement)
+
+```bash
+# Produces: .../gsm8k_transformer_epoch*.pt
+RUN_RL=0 bash scripts/train.sh gsm8k medium
+```
+
+2) **Run Stage 3 (DPO or GRPO)**
+
+Use either the convenience wrapper or call the training script directly.
+
+- Wrapper (auto-finds latest GSM8K SFT checkpoint):
+
+```bash
+# DPO (pairwise, 2 samples/prompt)
+YES=1 bash scripts/train_dpo_grpo.sh dpo medium
+
+# GRPO (grouped, outcome reward)
+YES=1 bash scripts/train_dpo_grpo.sh grpo medium
+```
+
+- Common knobs (environment variables passed through by `scripts/train_dpo_grpo.sh`):
+
+```bash
+# Typical: conservative DPO
+YES=1 BETA=0.1 TOP_P=0.95 TEMPERATURE=0.7 STEPS=800 bash scripts/train_dpo_grpo.sh dpo medium
+
+# Typical: GRPO with stronger KL and more samples
+YES=1 NUM_SAMPLES=8 KL_COEF=0.02 TOP_P=0.95 TEMPERATURE=0.8 STEPS=1200 bash scripts/train_dpo_grpo.sh grpo medium
+```
+
+If you want explicit control over paths/hparams, run:
+
+```bash
+python scripts/evaluation/dpo_grpo_training.py --help
+```
+
+### 🎯 Key Features
+
+- ✅ **DPO + GRPO implementations** for post-training
+- ✅ **Vectorized log-prob computation** with **per-token KL proxy** (typical in practice)
+- ✅ **GSM8K-aware answer extraction** (handles `#### answer` format)
+- ✅ **Reference model** support (stability / KL regularization)
+- ✅ **Hardware-oriented defaults** for 12GB VRAM GPUs
+
+---
+
+## Quick Start (Legacy)
+
+These commands are kept for reproducibility with earlier experiments.
+
+- For a more industry-standard preference-training stack, prefer the **3-stage pipeline above**.
+- The legacy GSM8K script optionally includes an outcome-RL refinement loop; when using DPO/GRPO, it is recommended to disable it via `RUN_RL=0`.
 
 ```bash
 # 1. Train base model on Orca-Math (~8-10 hours)
 bash scripts/train.sh orca
 
-# 2. Fine-tune on GSM8K with RL (~12-14 hours, auto-detects checkpoint)
-bash scripts/train.sh gsm8k
+# 2. Fine-tune on GSM8K (SFT). Recommended setting for the new pipeline:
+RUN_RL=0 bash scripts/train.sh gsm8k
 
 # 3. Evaluate
 python scripts/evaluation/eval_reasoning.py \
@@ -67,19 +179,17 @@ bash scripts/train.sh gsm8k [model_size]
 bash scripts/train.sh gpt2 [gpt2-small|gpt2-medium|gpt2-large|gpt2-xl]
 ```
 
-### RL Refinement
+### Legacy outcome-RL refinement (optional)
 
-GSM8K training includes RL refinement by default:
-- Best-of-n sampling (generates 8 solutions per problem)
-- Outcome-based rewards (correct answer gets positive reward)
-- Runs for 400 steps after supervised training
+The GSM8K training script can optionally run an additional outcome-RL refinement loop after SFT.
+This is **not required** when using Stage 3 (DPO/GRPO).
 
 ```bash
-# Skip RL refinement
+# Skip RL refinement (recommended when doing DPO/GRPO)
 RUN_RL=0 bash scripts/train.sh gsm8k
 
-# More RL steps
-RL_STEPS=600 bash scripts/train.sh gsm8k
+# Enable RL refinement (legacy baseline)
+RUN_RL=1 RL_STEPS=400 bash scripts/train.sh gsm8k
 ```
 
 ## Interpretability

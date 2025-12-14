@@ -16,8 +16,8 @@ def main():
     parser = argparse.ArgumentParser(description="Download Orca-Math-Word-Problems dataset")
     parser.add_argument("--output_dir", type=str, default="data",
                         help="Output directory for train/val text files")
-    parser.add_argument("--max_samples", type=int, default=100000,
-                        help="Maximum number of samples (default: 100k)")
+    parser.add_argument("--max_samples", type=int, default=0,
+                        help="Maximum number of samples (default: 0 = all available, ~200k)")
     parser.add_argument("--val_split", type=float, default=0.05,
                         help="Validation split ratio (default: 0.05 = 5%)")
     parser.add_argument("--min_length", type=int, default=50,
@@ -36,7 +36,10 @@ def main():
     train_file = output_dir / "orca_math_train.txt"
     val_file = output_dir / "orca_math_val.txt"
     
-    print(f"📥 Downloading Orca-Math-Word-Problems (max {args.max_samples:,} samples)...")
+    if args.max_samples == 0:
+        print(f"📥 Downloading Orca-Math-Word-Problems (ALL available samples, ~200k)...")
+    else:
+        print(f"📥 Downloading Orca-Math-Word-Problems (max {args.max_samples:,} samples)...")
     print(f"   Min length: {args.min_length} chars")
     print(f"   Max length: {args.max_length} chars")
     print()
@@ -59,7 +62,7 @@ def main():
         
         print("Processing and filtering examples...")
         for idx, item in enumerate(dataset):
-            if len(examples) >= args.max_samples:
+            if args.max_samples > 0 and len(examples) >= args.max_samples:
                 break
             
             # Extract question and answer

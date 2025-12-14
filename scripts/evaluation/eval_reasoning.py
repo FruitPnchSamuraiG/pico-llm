@@ -27,6 +27,8 @@ import tiktoken
 import importlib.util
 
 RE_ANSWER = re.compile(r"Answer:\s*([^\n\r]+)")
+RE_GSM8K_HASH = re.compile(r"####\s*([^\n\r]+)")
+RE_BOXED = re.compile(r"\\boxed\{([^}]+)\}")
 RE_A_COLON_FALLBACK = re.compile(r"\bA:\s*([-+]?\d+)\b")
 RE_LAST_INT = re.compile(r"([-+]?\d+)")
 
@@ -45,7 +47,16 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--max_new_tokens", type=int, default=64)
 
-    # Must match checkpoint
+    # Architecture presets (recommended)
+    p.add_argument(
+        "--transformer_size",
+        type=str,
+        default="",
+        choices=["", "small", "medium", "gpt2-small", "gpt2-medium", "gpt2-large", "gpt2-xl"],
+        help="Optional shortcut to set embed/heads/blocks/ff_mult to match training scripts.",
+    )
+
+    # Must match checkpoint (manual override)
     p.add_argument("--block_size", type=int, default=256)
     p.add_argument("--embed_size", type=int, default=384)
     p.add_argument("--transformer_heads", type=int, default=4)
@@ -68,20 +79,30 @@ def _load_inference_module() -> Any:
 
 
 def _extract_int_like(text: str) -> Optional[str]:
-    """Extract a single integer-like token from text.
+    """Extract an answer token from text.
 
     Priority:
-      1) 'Answer: X'
-      2) 'A: X'
-      3) last integer anywhere
+      1) '#### X' (GSM8K)
+      2) '\\boxed{X}'
+      3) 'Answer: X'
+      4) 'A: X'
+      5) last integer anywhere
     """
-    m = RE_ANSWER.search(text)
+    m = RE_GSM8K_HASH.search(text)
     if m:
         return m.group(1).strip().split()[0]
 
-    m2 = RE_A_COLON_FALLBACK.search(text)
+    mbox = RE_BOXED.search(text)
+    if mbox:
+        return mbox.group(1).strip().split()[0]
+
+    m2 = RE_ANSWER.search(text)
     if m2:
-        return m2.group(1).strip()
+        return m2.group(1).strip().split()[0]
+
+    m3 = RE_A_COLON_FALLBACK.search(text)
+    if m3:
+        return m3.group(1).strip()
 
     ms = RE_LAST_INT.findall(text)
     if ms:
@@ -91,18 +112,40 @@ def _extract_int_like(text: str) -> Optional[str]:
 
 
 def split_qa(line: str) -> Tuple[str, str]:
-    # Generated lines are: "Q: ... A: ... Answer: X"
-    # We only need a prompt that ends with 'A:' and a gold answer.
+    """Try to split both legacy 'Answer:' datasets and GSM8K '####' datasets."""
+    if "####" in line:
+        q_part, ans_part = line.split("####", 1)
+        gold = _extract_int_like("#### " + ans_part.strip()) or ""
+        prompt = q_part.strip()
+        if not prompt.endswith(" A:"):
+            prompt += " A:"
+        return prompt, gold
+
     if " A: " not in line:
         return line.strip(), ""
 
     q, rest = line.split(" A: ", 1)
-    gold = _extract_int_like(rest)  # works even if 'Answer:' missing
-    return (q.strip() + " A:"), (gold or "")
+    gold = _extract_int_like(rest) or ""
+    return (q.strip() + " A:"), gold
 
 
 def main() -> None:
     args = parse_args()
+
+    # Apply preset sizes if requested
+    if args.transformer_size:
+        if args.transformer_size == "small":
+            args.embed_size, args.transformer_heads, args.transformer_blocks, args.ff_mult = 384, 4, 3, 2
+        elif args.transformer_size == "medium":
+            args.embed_size, args.transformer_heads, args.transformer_blocks, args.ff_mult = 512, 8, 6, 4
+        elif args.transformer_size == "gpt2-small":
+            args.embed_size, args.transformer_heads, args.transformer_blocks, args.ff_mult = 768, 12, 12, 4
+        elif args.transformer_size == "gpt2-medium":
+            args.embed_size, args.transformer_heads, args.transformer_blocks, args.ff_mult = 1024, 16, 24, 4
+        elif args.transformer_size == "gpt2-large":
+            args.embed_size, args.transformer_heads, args.transformer_blocks, args.ff_mult = 1280, 20, 36, 4
+        elif args.transformer_size == "gpt2-xl":
+            args.embed_size, args.transformer_heads, args.transformer_blocks, args.ff_mult = 1600, 25, 48, 4
 
     device = torch.device(args.device if (not args.device.startswith("cuda") or torch.cuda.is_available()) else "cpu")
     enc = tiktoken.get_encoding("gpt2")

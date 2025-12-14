@@ -43,8 +43,8 @@ def parse_args():
     
     # Model selection
     parser.add_argument("--model", type=str, choices=["kgram", "lstm", "transformer"], 
-                        help="Model type to use for inference")
-    parser.add_argument("--checkpoint", type=str, 
+                        help="Model type (default: auto-detect from checkpoint)")
+    parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint file (.pt)")
     
     # Input
@@ -208,15 +208,89 @@ def decode_lookahead_search(model, enc, prompt: str, max_new_tokens: int, device
     return final_text, final_text
 
 
+def detect_transformer_architecture(state_dict):
+    """Auto-detect transformer architecture from checkpoint state_dict."""
+    # Extract key information from state dict
+    embed_weight = state_dict.get('embed.weight')
+    if embed_weight is None:
+        raise ValueError("Cannot find embed.weight in checkpoint")
+    
+    vocab_size, d_model = embed_weight.shape
+    
+    # Count number of transformer blocks
+    n_blocks = 0
+    for key in state_dict.keys():
+        if key.startswith('blocks.') and 'q_proj.weight' in key:
+            block_idx = int(key.split('.')[1])
+            n_blocks = max(n_blocks, block_idx + 1)
+    
+    # Detect number of heads from q_proj shape
+    q_proj_weight = state_dict.get('blocks.0.q_proj.weight')
+    if q_proj_weight is None:
+        raise ValueError("Cannot find blocks.0.q_proj.weight in checkpoint")
+    
+    # q_proj maps d_model -> d_model, and each head gets d_model/n_heads
+    # We need to infer n_heads from the architecture
+    # Check if there's a positional embedding to get block_size
+    pos_emb_weight = state_dict.get('pos_emb.weight')
+    if pos_emb_weight is not None:
+        block_size = pos_emb_weight.shape[0]
+    else:
+        block_size = 1024  # Default fallback
+    
+    # Detect n_heads: we know d_model and that q_proj outputs d_model
+    # Each head processes d_model/n_heads features
+    # Common configurations:
+    # 384 -> 4 heads (96 per head)
+    # 512 -> 8 heads (64 per head)
+    # 768 -> 12 heads (64 per head)
+    # 1024 -> 16 heads (64 per head)
+    
+    # Try common head sizes: 64, 96, 128, etc.
+    for head_dim in [64, 96, 128, 32, 48]:
+        if d_model % head_dim == 0:
+            n_heads = d_model // head_dim
+            # Verify this makes sense (typically 4-25 heads)
+            if 2 <= n_heads <= 32:
+                break
+    else:
+        # Fallback: assume 8 heads
+        n_heads = 8
+    
+    # Detect ff_mult from feedforward layer
+    ff_weight = state_dict.get('blocks.0.ff.0.weight')
+    if ff_weight is not None:
+        ff_hidden = ff_weight.shape[0]
+        ff_mult = ff_hidden // d_model
+    else:
+        ff_mult = 4  # Default
+    
+    return {
+        'vocab_size': vocab_size,
+        'd_model': d_model,
+        'n_heads': n_heads,
+        'n_blocks': n_blocks,
+        'block_size': block_size,
+        'ff_mult': ff_mult
+    }
+
+
 def load_model(model_type, checkpoint_path, args, device):
-    """Load a trained model from checkpoint."""
+    """Load a trained model from checkpoint with auto-detected architecture."""
     print(f"\n🔧 Loading {model_type} model from {checkpoint_path}")
     
     # Initialize tokenizer
     enc = tiktoken.get_encoding("gpt2")
     vocab_size = enc.n_vocab
     
-    # Create model with same config as training
+    # Load state dict first to detect architecture
+    try:
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except Exception as e:
+        print(f"❌ Error loading checkpoint file: {e}")
+        sys.exit(1)
+    
+    # Create model with auto-detected or specified config
     if model_type == "kgram":
         model = KGramMLPSeqModel(
             vocab_size=vocab_size,
@@ -232,27 +306,45 @@ def load_model(model_type, checkpoint_path, args, device):
             hidden_size=args.embed_size
         )
     elif model_type == "transformer":
+        # Auto-detect architecture from checkpoint
+        print("🔍 Auto-detecting transformer architecture from checkpoint...")
+        arch = detect_transformer_architecture(state_dict)
+        
+        print(f"   Detected: {arch['d_model']}-dim, {arch['n_heads']} heads, {arch['n_blocks']} blocks, {arch['ff_mult']}x FF")
+        print(f"   Block size: {arch['block_size']}, Vocab: {arch['vocab_size']}")
+        
+        # Map to known configurations for user reference
+        if arch['d_model'] == 384 and arch['n_heads'] == 4 and arch['n_blocks'] == 3:
+            print(f"   → This is a 'small' model (~10M params)")
+        elif arch['d_model'] == 512 and arch['n_heads'] == 8 and arch['n_blocks'] == 6:
+            print(f"   → This is a 'medium' model (~40M params)")
+        elif arch['d_model'] == 768 and arch['n_heads'] == 12 and arch['n_blocks'] == 12:
+            print(f"   → This is a 'gpt2-small' model (~117M params)")
+        elif arch['d_model'] == 1024 and arch['n_heads'] == 16 and arch['n_blocks'] == 24:
+            print(f"   → This is a 'gpt2-medium' model (~345M params)")
+        
         model = TransformerModel(
-            vocab_size=vocab_size,
-            block_size=args.block_size,
-            d_model=args.embed_size,
-            n_heads=args.transformer_heads,
-            n_blocks=args.transformer_blocks,
-            ff_mult=args.ff_mult
+            vocab_size=arch['vocab_size'],
+            block_size=arch['block_size'],
+            d_model=arch['d_model'],
+            n_heads=arch['n_heads'],
+            n_blocks=arch['n_blocks'],
+            ff_mult=arch['ff_mult']
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
-    # Load checkpoint
+    # Load checkpoint weights
     try:
-        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
         model.load_state_dict(state_dict)
         model.to(device)
         model.eval()
-        print(f"Model loaded successfully ({sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters)")
+        param_count = sum(p.numel() for p in model.parameters()) / 1e6
+        print(f"✅ Model loaded successfully ({param_count:.1f}M parameters)")
         return model
     except Exception as e:
-        print(f"Error loading checkpoint: {e}")
+        print(f"❌ Error loading state dict into model: {e}")
+        print("\nIf the error persists, the checkpoint may be corrupted or from an incompatible version.")
         sys.exit(1)
 
 
@@ -261,8 +353,10 @@ def run_single_inference(model_type, checkpoint_path, prompt, args, device):
     enc = tiktoken.get_encoding("gpt2")
 
     if model_type != "transformer":
-        print("This project extension is transformer-only. Re-run with --model transformer.")
-        sys.exit(2)
+        print("⚠️  Note: Advanced decoding strategies (beam, lookahead) are transformer-only.")
+        if args.decode not in ["greedy", "nucleus"]:
+            print(f"   Falling back to nucleus sampling for {model_type} model.")
+            args.decode = "nucleus"
 
     model = load_model(model_type, checkpoint_path, args, device)
 
@@ -308,6 +402,32 @@ def run_single_inference(model_type, checkpoint_path, prompt, args, device):
     print(f"\n{'='*70}\n")
 
 
+def detect_model_type_from_checkpoint(checkpoint_path, device):
+    """Auto-detect model type from checkpoint structure."""
+    try:
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        
+        # Check for transformer-specific keys
+        if any('blocks.' in key and 'q_proj' in key for key in state_dict.keys()):
+            return "transformer"
+        
+        # Check for LSTM-specific keys
+        if any('lstm.' in key for key in state_dict.keys()):
+            return "lstm"
+        
+        # Check for k-gram specific keys
+        if any('embedding' in key and 'net.' in key for key in state_dict.keys()):
+            return "kgram"
+        
+        # Default to transformer (most common)
+        print("⚠️  Could not definitively detect model type, assuming transformer")
+        return "transformer"
+    
+    except Exception as e:
+        print(f"⚠️  Error detecting model type: {e}, assuming transformer")
+        return "transformer"
+
+
 def main():
     args = parse_args()
     
@@ -320,12 +440,15 @@ def main():
     
     print(f"🔧 Using device: {device}")
     
-    # Single model mode
-    if not args.model or not args.checkpoint:
-        print("Single model mode requires --model and --checkpoint")
-        print("Run with --help for usage information")
-        sys.exit(1)
-    run_single_inference(args.model, args.checkpoint, args.prompt, args, device)
+    # Auto-detect model type if not specified
+    if not args.model:
+        print("🔍 Auto-detecting model type from checkpoint...")
+        model_type = detect_model_type_from_checkpoint(args.checkpoint, device)
+        print(f"   Detected: {model_type}")
+    else:
+        model_type = args.model
+    
+    run_single_inference(model_type, args.checkpoint, args.prompt, args, device)
 
 
 if __name__ == "__main__":
