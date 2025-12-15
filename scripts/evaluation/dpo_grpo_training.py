@@ -63,6 +63,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out_dir", type=str, required=True,
                    help="Output directory for checkpoints")
     
+    # ===== NEW: Pre-generated preferences =====
+    p.add_argument("--preference_data", type=str, default="",
+                   help="JSONL file with pre-generated preference pairs (MUCH FASTER). "
+                        "Generate with generate_preference_pairs.py. "
+                        "If provided, --train_data is only used for validation.")
+    p.add_argument("--online_generation", action="store_true",
+                   help="Force on-the-fly generation even if --preference_data provided (SLOW)")
+    
     # ===== Model architecture (must match init_from) =====
     # These will be auto-detected from checkpoint if possible
     p.add_argument("--block_size", type=int, default=256)
@@ -261,6 +269,88 @@ def approx_kl_per_token(
 
 
 # ============================================================================
+# Pre-generated Preference Loading
+# ============================================================================
+
+def load_preference_pairs(filepath: str) -> List[dict]:
+    """Load pre-generated preference pairs from JSONL file."""
+    pairs = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                pairs.append(json.loads(line))
+    return pairs
+
+
+def compute_logprob_and_len_batched(
+    model: nn.Module,
+    batch_tokens: List[List[int]],
+    batch_prompt_lens: List[int],
+    device: torch.device,
+    max_seq_len: int,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Compute log-probs for a batch of sequences (MUCH faster than sequential).
+    
+    This is the KEY optimization: batch multiple forward passes together.
+    Instead of B sequential forward passes, do 1 batched forward pass.
+    
+    Args:
+        model: The transformer model
+        batch_tokens: List of token sequences (variable length)
+        batch_prompt_lens: List of prompt lengths for each sequence
+        device: Torch device
+        max_seq_len: Maximum sequence length for padding
+    
+    Returns:
+        Tuple of (log_probs, cont_lens) lists
+    """
+    if not batch_tokens:
+        return [], []
+    
+    batch_size = len(batch_tokens)
+    
+    # Pad sequences to same length
+    padded_tokens = []
+    for tokens in batch_tokens:
+        padded = tokens + [0] * (max_seq_len - len(tokens))
+        padded_tokens.append(padded[:max_seq_len])
+    
+    # Create batch tensor: (batch_size, seq_len)
+    input_ids = torch.tensor(padded_tokens, dtype=torch.long, device=device)
+    
+    # Forward pass (BATCHED - this is the speedup!)
+    ctx = torch.enable_grad() if model.training else torch.no_grad()
+    with ctx:
+        # Transpose for model: (seq_len, batch_size)
+        logits = model(input_ids.transpose(0, 1))  # (seq_len, batch_size, vocab)
+        logp_all = F.log_softmax(logits, dim=-1)  # (seq_len, batch_size, vocab)
+    
+    # Extract log-probs for each sequence
+    seq_logps = []
+    cont_lens = []
+    
+    for i, (tokens, prompt_len) in enumerate(zip(batch_tokens, batch_prompt_lens)):
+        seq_len = len(tokens)
+        if seq_len <= prompt_len:
+            seq_logps.append(torch.tensor(0.0, device=device))
+            cont_lens.append(torch.tensor(0.0, device=device))
+            continue
+        
+        # Get predictions for continuation tokens
+        start_pred = max(0, prompt_len - 1)
+        end_pred = seq_len - 1
+        
+        pred_slice = logp_all[start_pred:end_pred, i, :]  # (N, vocab)
+        target_tokens = torch.tensor(tokens[prompt_len:seq_len], dtype=torch.long, device=device)
+        
+        token_logps = pred_slice.gather(1, target_tokens.unsqueeze(1)).squeeze(1)
+        seq_logps.append(token_logps.sum())
+        cont_lens.append(torch.tensor(float(target_tokens.numel()), device=device))
+    
+    return seq_logps, cont_lens
+
+
+# ============================================================================
 # DPO Loss
 # ============================================================================
 
@@ -382,7 +472,6 @@ def _evaluate_model_accuracy(
     inf: Any,
     max_new_tokens: int,
     top_p: float,
-    temperature: float,
     limit: int = 64,
 ) -> float:
     """Quick, cheap eval: sample 1 completion and check final answer correctness."""
@@ -405,7 +494,6 @@ def _evaluate_model_accuracy(
                 max_new_tokens=max_new_tokens,
                 device=str(device),
                 top_p=top_p,
-                temperature=temperature,
             )
             pred = extract_answer(text)
             total += 1
@@ -428,6 +516,19 @@ def train_dpo(
     out_dir: Path,
 ) -> None:
     """DPO training loop"""
+    
+    # Check if using pre-generated preferences
+    use_pregenerated = bool(args.preference_data) and not args.online_generation
+    
+    if use_pregenerated:
+        print("📦 Loading pre-generated preference pairs (FAST MODE)")
+        preference_pairs = load_preference_pairs(args.preference_data)
+        print(f"   ✓ Loaded {len(preference_pairs)} preference pairs")
+        print("   ⚡ This will be MUCH faster than on-the-fly generation!")
+    else:
+        print("⚠️  Using on-the-fly generation (SLOW MODE)")
+        print("   Tip: Pre-generate preferences with generate_preference_pairs.py for 10-100x speedup")
+        preference_pairs = None
     
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -453,91 +554,158 @@ def train_dpo(
     running_rejected_reward = 0.0
     
     for step in range(1, args.num_steps + 1):
-        batch_lines = random.sample(train_lines, k=min(args.batch_size, len(train_lines)))
-        
-        batch_losses = []
-        batch_accs = []
-        batch_chosen_rewards = []
-        batch_rejected_rewards = []
-        
-        optimizer.zero_grad(set_to_none=True)
-        
-        for line in batch_lines:
-            prompt, gold = split_qa(line)
-            if not gold:
-                continue
+        if use_pregenerated:
+            # Sample from pre-generated pairs
+            batch_pairs = random.sample(preference_pairs, k=min(args.batch_size, len(preference_pairs)))
             
-            prompt_tokens = enc.encode(prompt)
-            max_prompt = max(1, args.block_size - args.max_new_tokens)
-            if len(prompt_tokens) > max_prompt:
-                prompt_tokens = prompt_tokens[-max_prompt:]
-                prompt = enc.decode(prompt_tokens)
+            # Prepare batches for parallel processing
+            chosen_tokens_batch = [pair["chosen"]["tokens"] for pair in batch_pairs]
+            rejected_tokens_batch = [pair["rejected"]["tokens"] for pair in batch_pairs]
+            prompt_lens_batch = [len(pair["prompt_tokens"]) for pair in batch_pairs]
             
-            # Sample TWO completions for (synthetic) preference pair.
-            completions = []
-            for _ in range(2):
-                text, _ = inf.generate_text(
-                    model,
-                    enc,
-                    prompt,
-                    max_new_tokens=args.max_new_tokens,
-                    device=str(device),
-                    top_p=args.top_p,
-                    temperature=args.temperature,
-                )
-                full_tokens = enc.encode(text)[: args.block_size]
-                pred = extract_answer(text)
-                reward = args.reward_correct if (pred == gold) else args.reward_incorrect
-                completions.append((full_tokens, reward))
+            max_len = max(max(len(t) for t in chosen_tokens_batch), 
+                         max(len(t) for t in rejected_tokens_batch))
             
-            completions.sort(key=lambda x: x[1], reverse=True)
-            chosen_tokens, chosen_reward = completions[0]
-            rejected_tokens, rejected_reward = completions[1]
+            optimizer.zero_grad(set_to_none=True)
             
-            if chosen_reward == rejected_reward:
-                continue
-            
-            # Compute seq log-probs and continuation lengths (vectorized).
-            policy_chosen_logp, chosen_len = compute_logprob_and_len(model, chosen_tokens, len(prompt_tokens), device)
-            policy_rejected_logp, rejected_len = compute_logprob_and_len(model, rejected_tokens, len(prompt_tokens), device)
-            
-            with torch.no_grad():
-                ref_chosen_logp, _ = compute_logprob_and_len(reference_model, chosen_tokens, len(prompt_tokens), device)
-                ref_rejected_logp, _ = compute_logprob_and_len(reference_model, rejected_tokens, len(prompt_tokens), device)
-            
-            loss, chosen_rew, rejected_rew = dpo_loss(
-                policy_chosen_logp,
-                policy_rejected_logp,
-                ref_chosen_logp,
-                ref_rejected_logp,
-                beta=args.beta,
+            # BATCHED forward passes (10-100x faster!)
+            policy_chosen_logps, chosen_lens = compute_logprob_and_len_batched(
+                model, chosen_tokens_batch, prompt_lens_batch, device, max_len
+            )
+            policy_rejected_logps, rejected_lens = compute_logprob_and_len_batched(
+                model, rejected_tokens_batch, prompt_lens_batch, device, max_len
             )
             
-            batch_losses.append(loss)
-            batch_accs.append(1.0)
-            batch_chosen_rewards.append(chosen_rew.item())
-            batch_rejected_rewards.append(rejected_rew.item())
+            with torch.no_grad():
+                ref_chosen_logps, _ = compute_logprob_and_len_batched(
+                    reference_model, chosen_tokens_batch, prompt_lens_batch, device, max_len
+                )
+                ref_rejected_logps, _ = compute_logprob_and_len_batched(
+                    reference_model, rejected_tokens_batch, prompt_lens_batch, device, max_len
+                )
+            
+            # Compute losses for batch
+            batch_losses = []
+            batch_chosen_rewards = []
+            batch_rejected_rewards = []
+            
+            for i in range(len(batch_pairs)):
+                loss, chosen_rew, rejected_rew = dpo_loss(
+                    policy_chosen_logps[i],
+                    policy_rejected_logps[i],
+                    ref_chosen_logps[i],
+                    ref_rejected_logps[i],
+                    beta=args.beta,
+                )
+                batch_losses.append(loss)
+                batch_chosen_rewards.append(chosen_rew.item())
+                batch_rejected_rewards.append(rejected_rew.item())
+            
+            if batch_losses:
+                total_loss = torch.stack(batch_losses).mean()
+                total_loss.backward()
+                
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                
+                optimizer.step()
+                scheduler.step()
+                
+                running_loss = 0.9 * running_loss + 0.1 * total_loss.item()
+                running_acc = 0.9 * running_acc + 0.1 * 1.0
+                running_chosen_reward = 0.9 * running_chosen_reward + 0.1 * (
+                    sum(batch_chosen_rewards) / max(1, len(batch_chosen_rewards))
+                )
+                running_rejected_reward = 0.9 * running_rejected_reward + 0.1 * (
+                    sum(batch_rejected_rewards) / max(1, len(batch_rejected_rewards))
+                )
         
-        if not batch_losses:
-            continue
-        
-        total_loss = torch.stack(batch_losses).mean()
-        total_loss.backward()
-        
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        
-        optimizer.step()
-        scheduler.step()
-        
-        running_loss = 0.9 * running_loss + 0.1 * total_loss.item()
-        running_acc = 0.9 * running_acc + 0.1 * (sum(batch_accs) / max(1, len(batch_accs)))
-        running_chosen_reward = 0.9 * running_chosen_reward + 0.1 * (
-            sum(batch_chosen_rewards) / max(1, len(batch_chosen_rewards))
-        )
-        running_rejected_reward = 0.9 * running_rejected_reward + 0.1 * (
-            sum(batch_rejected_rewards) / max(1, len(batch_rejected_rewards))
-        )
+        else:
+            # Original on-the-fly generation (SLOW)
+            batch_lines = random.sample(train_lines, k=min(args.batch_size, len(train_lines)))
+            
+            batch_losses = []
+            batch_accs = []
+            batch_chosen_rewards = []
+            batch_rejected_rewards = []
+            
+            optimizer.zero_grad(set_to_none=True)
+            
+            for line in batch_lines:
+                prompt, gold = split_qa(line)
+                if not gold:
+                    continue
+                
+                prompt_tokens = enc.encode(prompt)
+                max_prompt = max(1, args.block_size - args.max_new_tokens)
+                if len(prompt_tokens) > max_prompt:
+                    prompt_tokens = prompt_tokens[-max_prompt:]
+                    prompt = enc.decode(prompt_tokens)
+                
+                # Sample TWO completions for (synthetic) preference pair.
+                completions = []
+                for _ in range(2):
+                    text, _ = inf.generate_text(
+                        model,
+                        enc,
+                        prompt,
+                        max_new_tokens=args.max_new_tokens,
+                        device=str(device),
+                        top_p=args.top_p,
+                    )
+                    full_tokens = enc.encode(text)[: args.block_size]
+                    pred = extract_answer(text)
+                    reward = args.reward_correct if (pred == gold) else args.reward_incorrect
+                    completions.append((full_tokens, reward))
+                
+                completions.sort(key=lambda x: x[1], reverse=True)
+                chosen_tokens, chosen_reward = completions[0]
+                rejected_tokens, rejected_reward = completions[1]
+                
+                if chosen_reward == rejected_reward:
+                    continue
+                
+                # Compute seq log-probs and continuation lengths (vectorized).
+                policy_chosen_logp, chosen_len = compute_logprob_and_len(model, chosen_tokens, len(prompt_tokens), device)
+                policy_rejected_logp, rejected_len = compute_logprob_and_len(model, rejected_tokens, len(prompt_tokens), device)
+                
+                with torch.no_grad():
+                    ref_chosen_logp, _ = compute_logprob_and_len(reference_model, chosen_tokens, len(prompt_tokens), device)
+                    ref_rejected_logp, _ = compute_logprob_and_len(reference_model, rejected_tokens, len(prompt_tokens), device)
+                
+                loss, chosen_rew, rejected_rew = dpo_loss(
+                    policy_chosen_logp,
+                    policy_rejected_logp,
+                    ref_chosen_logp,
+                    ref_rejected_logp,
+                    beta=args.beta,
+                )
+                
+                batch_losses.append(loss)
+                batch_accs.append(1.0)
+                batch_chosen_rewards.append(chosen_rew.item())
+                batch_rejected_rewards.append(rejected_rew.item())
+            
+            if not batch_losses:
+                continue
+            
+            total_loss = torch.stack(batch_losses).mean()
+            total_loss.backward()
+            
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            
+            optimizer.step()
+            scheduler.step()
+            
+            running_loss = 0.9 * running_loss + 0.1 * total_loss.item()
+            running_acc = 0.9 * running_acc + 0.1 * (sum(batch_accs) / max(1, len(batch_accs)))
+            running_chosen_reward = 0.9 * running_chosen_reward + 0.1 * (
+                sum(batch_chosen_rewards) / max(1, len(batch_chosen_rewards))
+            )
+            running_rejected_reward = 0.9 * running_rejected_reward + 0.1 * (
+                sum(batch_rejected_rewards) / max(1, len(batch_rejected_rewards))
+            )
         
         if step % args.log_every == 0:
             lr = optimizer.param_groups[0]["lr"]
@@ -557,7 +725,6 @@ def train_dpo(
                 inf=inf,
                 max_new_tokens=args.max_new_tokens,
                 top_p=args.top_p,
-                temperature=args.temperature,
                 limit=64,
             )
             print(f"[DPO] eval(step={step}) val_acc@1={val_acc:.3f}")
@@ -639,7 +806,6 @@ def train_grpo(
                     max_new_tokens=args.max_new_tokens,
                     device=str(device),
                     top_p=args.top_p,
-                    temperature=args.temperature,
                 )
                 full_tokens = enc.encode(text)[: args.block_size]
                 pred = extract_answer(text)
@@ -711,7 +877,6 @@ def train_grpo(
                 inf=inf,
                 max_new_tokens=args.max_new_tokens,
                 top_p=args.top_p,
-                temperature=args.temperature,
                 limit=64,
             )
             print(f"[GRPO] eval(step={step}) val_acc@1={val_acc:.3f}")
@@ -729,6 +894,29 @@ def train_grpo(
 # ============================================================================
 # Main
 # ============================================================================
+
+def _infer_ckpt_arch(state: dict) -> tuple[int | None, int | None]:
+    """Best-effort inference of (embed_size, n_blocks) from a state_dict."""
+    try:
+        embed = int(state["embed.weight"].shape[1])
+    except Exception:
+        embed = None
+
+    blocks = None
+    try:
+        idxs = []
+        for k in state.keys():
+            if k.startswith("blocks."):
+                parts = k.split(".")
+                if len(parts) > 1 and parts[1].isdigit():
+                    idxs.append(int(parts[1]))
+        if idxs:
+            blocks = max(idxs) + 1
+    except Exception:
+        blocks = None
+
+    return embed, blocks
+
 
 def main() -> None:
     args = parse_args()
@@ -775,7 +963,29 @@ def main() -> None:
     
     print(f"📦 Loading base checkpoint: {args.init_from}")
     state = torch.load(args.init_from, map_location=device, weights_only=True)
-    policy_model.load_state_dict(state)
+
+    try:
+        policy_model.load_state_dict(state)
+    except RuntimeError as e:
+        ckpt_embed, ckpt_blocks = _infer_ckpt_arch(state)
+        msg = [
+            "Checkpoint/architecture mismatch while loading weights.",
+            f"  requested --transformer_size: {args.transformer_size}",
+        ]
+        if ckpt_embed is not None or ckpt_blocks is not None:
+            msg.append(f"  checkpoint appears to be: embed_size={ckpt_embed}, n_blocks={ckpt_blocks}")
+        msg.extend(
+            [
+                "Common cause: using a GSM8K SFT checkpoint trained with a different model size.",
+                "Fix:",
+                "  1) Point --init_from to a checkpoint produced with the SAME model size, or",
+                "  2) Re-run Stage 2 with TRANSFORMER_SIZE matching Stage 3, then rerun DPO/GRPO.",
+                "Tip: you can inspect a checkpoint with:",
+                "  python scripts/utils/check_checkpoint_arch.py <checkpoint.pt>",
+            ]
+        )
+        raise RuntimeError("\n".join(msg)) from e
+
     policy_model.to(device)
     
     # Create reference model (frozen copy for KL penalty)

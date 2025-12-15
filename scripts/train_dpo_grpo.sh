@@ -22,6 +22,7 @@ MODEL_SIZE=${2:-medium}  # small, medium, gpt2-small
 DEVICE=${DEVICE:-cuda:0}
 OUTDIR=${OUTDIR:-/scratch/kk6081/picollm_extend}
 YES=${YES:-0}  # set to 1 to skip interactive prompts
+CLEAN_OLD_CHECKPOINTS=${CLEAN_OLD_CHECKPOINTS:-1}  # default: cleanup before training
 
 # Stage-3 hyperparameters (overridable)
 NUM_STEPS=${NUM_STEPS:-500}
@@ -37,26 +38,57 @@ NUM_SAMPLES=${NUM_SAMPLES:-8}
 ADVANTAGE_TYPE=${ADVANTAGE_TYPE:-group_relative}
 
 # Auto-detect SFT checkpoint (GSM8K fine-tuned model from Stage 2)
-# Priority: 1) Manual SFT_CKPT env var, 2) GSM8K-specific checkpoints, 3) Latest finetune checkpoint
+# Priority: 1) Manual SFT_CKPT env var, 2) GSM8K checkpoints matching MODEL_SIZE
 if [ -n "${SFT_CKPT:-}" ]; then
   BASE_CKPT="$SFT_CKPT"
   echo "✓ Using manual SFT checkpoint: $BASE_CKPT"
 else
-  # Look for GSM8K SFT checkpoints first
-  BASE_CKPT=$(ls -t "$OUTDIR"/gsm8k_transformer_epoch*.pt 2>/dev/null | head -1)
+  # Helper to find checkpoint matching architecture
+  find_matching_ckpt() {
+    local size="$1"
+    local outdir="$2"
+    local want_embed want_blocks
+    
+    case "$size" in
+      small) want_embed=384; want_blocks=3 ;;
+      medium) want_embed=512; want_blocks=6 ;;
+      gpt2-small) want_embed=768; want_blocks=12 ;;
+      *) return 1 ;;
+    esac
+    
+    local candidates=(
+      "${outdir}/gsm8k_transformer_epoch"*.pt
+      "${outdir}/finetune_gsm8k/transformer_epoch"*.pt
+    )
+    
+    for ckpt in $(ls -t ${candidates[@]} 2>/dev/null); do
+      local info
+      info=$(python scripts/utils/check_checkpoint_arch.py "$ckpt" 2>/dev/null || true)
+      local embed blocks
+      embed=$(echo "$info" | awk '/embed_size:/ {print $2; exit}')
+      blocks=$(echo "$info" | awk '/n_blocks:/ {print $2; exit}')
+      
+      if [[ "$embed" == "$want_embed" && "$blocks" == "$want_blocks" ]]; then
+        echo "$ckpt"
+        return 0
+      fi
+    done
+    
+    return 1
+  }
+  
+  BASE_CKPT=$(find_matching_ckpt "$MODEL_SIZE" "$OUTDIR" || true)
   
   if [ -z "$BASE_CKPT" ]; then
-    # Fallback: finetune directory
-    BASE_CKPT=$(ls -t "$OUTDIR"/finetune_gsm8k/transformer_epoch*.pt 2>/dev/null | head -1)
-  fi
-  
-  if [ -z "$BASE_CKPT" ]; then
-    # Last resort: any recent checkpoint (with warning)
+    # Last resort: any recent checkpoint (with strong warning)
     BASE_CKPT=$(ls -t "$OUTDIR"/transformer_epoch*.pt 2>/dev/null | head -1)
     if [ -n "$BASE_CKPT" ]; then
-      echo "⚠️  WARNING: Using non-GSM8K checkpoint: $BASE_CKPT"
-      echo "   For best results, first run GSM8K SFT (Stage 2):"
-      echo "   bash scripts/train.sh gsm8k"
+      echo "⚠️  WARNING: No GSM8K checkpoint found matching $MODEL_SIZE!"
+      echo "   Found non-matching checkpoint: $BASE_CKPT"
+      echo "   This will likely cause architecture mismatch errors."
+      echo ""
+      echo "   Recommended: Run Stage 2 with matching model size:"
+      echo "   bash scripts/train.sh gsm8k $MODEL_SIZE"
       echo ""
       if [[ "$YES" != "1" ]]; then
         read -p "Continue anyway? (y/N): " -n 1 -r
@@ -65,9 +97,11 @@ else
           exit 1
         fi
       else
-        echo "YES=1 set; continuing non-interactively."
+        echo "YES=1 set; continuing (will likely fail on arch mismatch)."
       fi
     fi
+  else
+    echo "✓ Found GSM8K SFT checkpoint matching $MODEL_SIZE: $BASE_CKPT"
   fi
 fi
 
@@ -100,18 +134,29 @@ echo ""
 
 # Output directory
 OUT_DIR="$OUTDIR/${MODE}_gsm8k_${MODEL_SIZE}"
+
+# Cleanup old DPO/GRPO checkpoints (default enabled)
+if [[ "$CLEAN_OLD_CHECKPOINTS" == "1" ]]; then
+  echo "🧹 Cleaning old ${MODE^^} checkpoints..."
+  rm -rf "$OUT_DIR" 2>/dev/null || true
+  rm -f "$OUTDIR"/transformer_${MODE}_*.pt 2>/dev/null || true
+  echo "   ✓ Removed old ${MODE^^} outputs"
+  echo ""
+fi
+
 mkdir -p "$OUT_DIR"
 
-# Hyperparameters (optimized for GTX TITAN X 12GB)
+# Hyperparameters (conservative for GTX TITAN X 12GB)
+# DPO/GRPO needs more memory due to reference model + policy model
 case "$MODEL_SIZE" in
   small)
-    BATCH=${BATCH:-16}
+    BATCH=${BATCH:-8}   # Conservative for DPO/GRPO (uses 2 models)
     ;;
   medium)
-    BATCH=${BATCH:-8}
+    BATCH=${BATCH:-32}   # Increased for better GPU utilization
     ;;
   gpt2-small)
-    BATCH=${BATCH:-4}  # Tight on 12GB
+    BATCH=${BATCH:-2}   # Very conservative for largest model
     ;;
   *)
     echo "❌ Unsupported model size: $MODEL_SIZE"
@@ -162,10 +207,13 @@ elif [ "$MODE" == "grpo" ]; then
   
   # If user didn't override NUM_SAMPLES, auto-adjust for tight memory.
   if [[ -z "${NUM_SAMPLES_OVERRIDE:-}" ]]; then
-    if [ "$BATCH" -le 4 ]; then
-      NUM_SAMPLES=4
+    # GRPO uses batch_size * num_samples total memory
+    if [ "$BATCH" -le 2 ]; then
+      NUM_SAMPLES=2  # Very tight memory
+    elif [ "$BATCH" -le 4 ]; then
+      NUM_SAMPLES=4  # Conservative
     else
-      NUM_SAMPLES=${NUM_SAMPLES:-8}
+      NUM_SAMPLES=${NUM_SAMPLES:-6}  # Reduced from 8
     fi
   fi
   

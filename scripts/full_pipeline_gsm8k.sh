@@ -30,13 +30,18 @@ SKIP_STAGE2=${SKIP_STAGE2:-0}  # Set to 1 if GSM8K SFT already done
 SKIP_STAGE3=${SKIP_STAGE3:-0}  # Set to 1 if you only want SFT
 YES=${YES:-0}                 # set to 1 to skip confirmation prompt
 
+# Cleanup control (remove old outputs before stages) - DEFAULT: ENABLED
+CLEAN_STAGE1=${CLEAN_STAGE1:-1}
+CLEAN_STAGE2=${CLEAN_STAGE2:-1}
+CLEAN_STAGE3=${CLEAN_STAGE3:-1}
+
 # Stage 1 config (Orca-Math)
 STAGE1_EPOCHS=${STAGE1_EPOCHS:-8}
 STAGE1_BATCH=${STAGE1_BATCH:-16}
 STAGE1_LR=${STAGE1_LR:-3e-4}
 
 # Stage 2 config (GSM8K SFT)
-STAGE2_EPOCHS=${STAGE2_EPOCHS:-8}
+STAGE2_EPOCHS=${STAGE2_EPOCHS:-4}  # Reduced from 8 to prevent overfitting
 STAGE2_BATCH=${STAGE2_BATCH:-16}
 STAGE2_LR=${STAGE2_LR:-2e-4}
 STAGE2_RUN_RL=${STAGE2_RUN_RL:-0}  # Disable old RL (we use DPO/GRPO instead)
@@ -51,22 +56,28 @@ STAGE3_MAX_NEW_TOKENS=${STAGE3_MAX_NEW_TOKENS:-128}
 STAGE3_TEMPERATURE=${STAGE3_TEMPERATURE:-1.0}
 STAGE3_TOP_P=${STAGE3_TOP_P:-0.95}
 
-# Auto-adjust batch sizes for model size
+# Auto-adjust batch sizes, block sizes, and data for model size
 case "$MODEL_SIZE" in
   small)
     STAGE1_BATCH=${STAGE1_BATCH:-16}
     STAGE2_BATCH=${STAGE2_BATCH:-16}
     STAGE3_BATCH=16
+    BLOCK_SIZE=${BLOCK_SIZE:-256}
+    MAX_SAMPLES=${MAX_SAMPLES:-100000}  # 100k for small models
     ;;
   medium)
     STAGE1_BATCH=${STAGE1_BATCH:-16}
     STAGE2_BATCH=${STAGE2_BATCH:-16}
     STAGE3_BATCH=8
+    BLOCK_SIZE=${BLOCK_SIZE:-256}
+    MAX_SAMPLES=${MAX_SAMPLES:-100000}  # 100k for medium models
     ;;
   gpt2-small)
     STAGE1_BATCH=${STAGE1_BATCH:-8}
     STAGE2_BATCH=${STAGE2_BATCH:-8}
     STAGE3_BATCH=4
+    BLOCK_SIZE=${BLOCK_SIZE:-512}  # Longer context for gpt2-small
+    MAX_SAMPLES=${MAX_SAMPLES:-0}  # Use ALL ~200k examples for gpt2-small
     ;;
   *)
     echo "❌ Unsupported model size: $MODEL_SIZE"
@@ -94,6 +105,8 @@ echo "  Model Size: $MODEL_SIZE"
 echo "  Device: $DEVICE"
 echo "  Output Dir: $OUTDIR"
 echo "  RL Algorithm: $RL_MODE"
+echo "  Block Size (context): $BLOCK_SIZE tokens"
+echo "  Orca-Math samples: $([ "$MAX_SAMPLES" -eq 0 ] && echo "ALL (~200k)" || echo "$MAX_SAMPLES")"
 echo ""
 echo "🎛️  Hyperparameters:"
 echo "  Stage 1: epochs=$STAGE1_EPOCHS, batch=$STAGE1_BATCH, lr=$STAGE1_LR"
@@ -104,6 +117,11 @@ echo "⏭️  Skip Control:"
 echo "  SKIP_STAGE1=$SKIP_STAGE1 (Orca training)"
 echo "  SKIP_STAGE2=$SKIP_STAGE2 (GSM8K SFT)"
 echo "  SKIP_STAGE3=$SKIP_STAGE3 (DPO/GRPO)"
+echo ""
+echo "🧹 Cleanup (remove old checkpoints before each stage):"
+echo "  CLEAN_STAGE1=$CLEAN_STAGE1 (default: 1)"
+echo "  CLEAN_STAGE2=$CLEAN_STAGE2 (default: 1)"
+echo "  CLEAN_STAGE3=$CLEAN_STAGE3 (default: 1)"
 echo ""
 echo "================================================================================"
 echo ""
@@ -121,10 +139,72 @@ else
 fi
 
 # ============================================================================
+# Utilities
+# ============================================================================
+
+latest_ckpt_matching_size() {
+  # Prefer checkpoints that were produced under finetune_gsm8k/ and match the requested MODEL_SIZE.
+  # This prevents accidentally loading a medium checkpoint while running gpt2-small (or vice versa).
+  local size="$1"
+  local outdir="$2"
+
+  local want_embed
+  local want_blocks
+  case "$size" in
+    small) want_embed=384; want_blocks=3 ;;
+    medium) want_embed=512; want_blocks=6 ;;
+    gpt2-small) want_embed=768; want_blocks=12 ;;
+    *)
+      echo ""
+      return 1
+      ;;
+  esac
+
+  local candidates=(
+    "${outdir}/finetune_gsm8k/transformer_epoch"*.pt
+    "${outdir}/gsm8k_transformer_epoch"*.pt
+  )
+
+  # shellcheck disable=SC2086
+  local ckpt
+  for ckpt in $(ls -t ${candidates[@]} 2>/dev/null); do
+    # check_checkpoint_arch.py prints embed_size and n_blocks; parse those and compare.
+    local info
+    info=$(python scripts/utils/check_checkpoint_arch.py "$ckpt" 2>/dev/null || true)
+    local embed
+    local blocks
+    embed=$(echo "$info" | awk '/embed_size:/ {print $2; exit}')
+    blocks=$(echo "$info" | awk '/n_blocks:/ {print $2; exit}')
+
+    if [[ "$embed" == "$want_embed" && "$blocks" == "$want_blocks" ]]; then
+      echo "$ckpt"
+      return 0
+    fi
+  done
+
+  echo ""
+  return 1
+}
+
+rm_if_exists() {
+  local p="$1"
+  if [[ -e "$p" ]]; then
+    rm -rf "$p"
+  fi
+}
+
+# ============================================================================
 # Stage 1: Orca-Math Base Training
 # ============================================================================
 
 STAGE1_CKPT="$OUTDIR/transformer_epoch${STAGE1_EPOCHS}.pt"
+
+if [[ "$CLEAN_STAGE1" == "1" && "$SKIP_STAGE1" != "1" ]]; then
+  echo ""
+  echo "🧹 Cleaning old Stage-1 checkpoints before training..."
+  rm -f "$OUTDIR"/transformer_epoch*.pt 2>/dev/null || true
+  echo "   ✓ Removed old Orca base checkpoints"
+fi
 
 if [ "$SKIP_STAGE1" == "1" ]; then
   echo ""
@@ -157,6 +237,8 @@ else
   TRANSFORMER_SIZE=$MODEL_SIZE \
   DEVICE=$DEVICE \
   OUTDIR=$OUTDIR \
+  BLOCK_SIZE=$BLOCK_SIZE \
+  MAX_SAMPLES=$MAX_SAMPLES \
   bash scripts/train.sh orca
   
   if [ ! -f "$STAGE1_CKPT" ]; then
@@ -177,28 +259,32 @@ fi
 # Expected SFT checkpoint location
 STAGE2_CKPT="$OUTDIR/gsm8k_transformer_epoch${STAGE2_EPOCHS}.pt"
 
+if [[ "$CLEAN_STAGE2" == "1" && "$SKIP_STAGE2" != "1" ]]; then
+  echo ""
+  echo "🧹 Cleaning old Stage-2 checkpoints before training..."
+  rm -rf "$OUTDIR/finetune_gsm8k" 2>/dev/null || true
+  rm -f "$OUTDIR"/gsm8k_transformer_epoch*.pt 2>/dev/null || true
+  rm -f "$OUTDIR"/gsm8k_rl.pt 2>/dev/null || true
+  rm -rf "$OUTDIR/rl_gsm8k" 2>/dev/null || true
+  echo "   ✓ Removed old GSM8K SFT checkpoints and finetune directories"
+fi
+
 if [ "$SKIP_STAGE2" == "1" ]; then
   echo ""
   echo "⏭️  STAGE 2 SKIPPED (SKIP_STAGE2=1)"
   echo ""
   
-  # Check if SFT checkpoint exists
-  if [ ! -f "$STAGE2_CKPT" ]; then
-    echo "⚠️  Warning: Expected GSM8K SFT checkpoint not found: $STAGE2_CKPT"
-    # Try to find any GSM8K checkpoint
-    STAGE2_CKPT=$(ls -t "$OUTDIR"/gsm8k_transformer_epoch*.pt 2>/dev/null | head -1)
-    if [ -z "$STAGE2_CKPT" ]; then
-      # Try finetune directory
-      STAGE2_CKPT=$(ls -t "$OUTDIR"/finetune_gsm8k/transformer_epoch*.pt 2>/dev/null | head -1)
-    fi
-    if [ -z "$STAGE2_CKPT" ]; then
-      echo "❌ No GSM8K SFT checkpoint found! Cannot skip Stage 2."
-      exit 1
-    fi
-    echo "✓ Using existing SFT checkpoint: $STAGE2_CKPT"
-  else
-    echo "✓ Using GSM8K SFT checkpoint: $STAGE2_CKPT"
+  # Find checkpoint matching the requested model size to avoid arch mismatches
+  STAGE2_CKPT=$(latest_ckpt_matching_size "$MODEL_SIZE" "$OUTDIR" || true)
+  
+  if [ -z "$STAGE2_CKPT" ]; then
+    echo "❌ No GSM8K SFT checkpoint found matching model size '$MODEL_SIZE'!"
+    echo "   Run: python scripts/utils/check_checkpoint_arch.py <your_checkpoint.pt>"
+    echo "   to verify checkpoint architecture, or run Stage 2 with matching MODEL_SIZE."
+    exit 1
   fi
+  
+  echo "✓ Found GSM8K SFT checkpoint matching $MODEL_SIZE: $STAGE2_CKPT"
 else
   echo ""
   echo "================================================================================"
@@ -219,18 +305,17 @@ else
   
   # Verify checkpoint was created
   if [ ! -f "$STAGE2_CKPT" ]; then
-    echo "⚠️  Expected checkpoint not found: $STAGE2_CKPT"
-    # Try to find the actual checkpoint
-    STAGE2_CKPT=$(ls -t "$OUTDIR"/gsm8k_transformer_epoch*.pt 2>/dev/null | head -1)
-    if [ -z "$STAGE2_CKPT" ]; then
-      STAGE2_CKPT=$(ls -t "$OUTDIR"/finetune_gsm8k/transformer_epoch*.pt 2>/dev/null | head -1)
-    fi
-    if [ -z "$STAGE2_CKPT" ]; then
-      echo "❌ Stage 2 failed: No SFT checkpoint created"
-      exit 1
-    fi
-    echo "✓ Found SFT checkpoint: $STAGE2_CKPT"
+    # If non-default epoch name didn't appear (or user changed STAGE2_EPOCHS), pick the latest matching ckpt.
+    STAGE2_CKPT=$(latest_ckpt_matching_size "$MODEL_SIZE" "$OUTDIR" || true)
   fi
+
+  if [ -z "$STAGE2_CKPT" ] || [ ! -f "$STAGE2_CKPT" ]; then
+    echo "❌ Stage 2 failed: GSM8K SFT checkpoint not created (or size mismatch)"
+    echo "   Tip: set CLEAN_STAGE2=1 to remove old incompatible checkpoints."
+    exit 1
+  fi
+
+  echo "✓ Using GSM8K SFT checkpoint: $STAGE2_CKPT"
   
   echo ""
   echo "✅ STAGE 2 COMPLETE"
@@ -241,6 +326,15 @@ fi
 # ============================================================================
 # Stage 3: DPO/GRPO Post-Training
 # ============================================================================
+
+if [[ "$CLEAN_STAGE3" == "1" && "$SKIP_STAGE3" != "1" ]]; then
+  echo ""
+  echo "🧹 Cleaning old Stage-3 checkpoints before training..."
+  rm -rf "$OUTDIR/dpo_grpo_${MODEL_SIZE}" 2>/dev/null || true
+  rm -f "$OUTDIR"/transformer_dpo_*.pt 2>/dev/null || true
+  rm -f "$OUTDIR"/transformer_grpo_*.pt 2>/dev/null || true
+  echo "   ✓ Removed old DPO/GRPO checkpoints"
+fi
 
 if [ "$SKIP_STAGE3" == "1" ]; then
   echo ""

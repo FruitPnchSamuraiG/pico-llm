@@ -20,10 +20,10 @@ def main():
                         help="Maximum number of samples (default: 0 = all available, ~200k)")
     parser.add_argument("--val_split", type=float, default=0.05,
                         help="Validation split ratio (default: 0.05 = 5%)")
-    parser.add_argument("--min_length", type=int, default=50,
-                        help="Minimum text length to include (chars)")
-    parser.add_argument("--max_length", type=int, default=1024,
-                        help="Maximum text length to include (chars)")
+    parser.add_argument("--min_length", type=int, default=0,
+                        help="Minimum text length to include (chars, 0=no limit)")
+    parser.add_argument("--max_length", type=int, default=0,
+                        help="Maximum text length to include (chars, 0=no limit)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     
@@ -40,8 +40,12 @@ def main():
         print(f"📥 Downloading Orca-Math-Word-Problems (ALL available samples, ~200k)...")
     else:
         print(f"📥 Downloading Orca-Math-Word-Problems (max {args.max_samples:,} samples)...")
-    print(f"   Min length: {args.min_length} chars")
-    print(f"   Max length: {args.max_length} chars")
+    
+    if args.min_length > 0 or args.max_length > 0:
+        print(f"   Length filters: min={args.min_length if args.min_length > 0 else 'none'}, "
+              f"max={args.max_length if args.max_length > 0 else 'none'} chars")
+    else:
+        print(f"   Length filters: DISABLED (keeping all sequence lengths)")
     print()
     
     try:
@@ -75,11 +79,11 @@ def main():
             # Format: Q: ... A: ... (single line for pico-llm)
             text = f"Q: {question} A: {answer}"
             
-            # Filter by length
-            if len(text) < args.min_length:
+            # Filter by length (only if limits are set)
+            if args.min_length > 0 and len(text) < args.min_length:
                 skipped_too_short += 1
                 continue
-            if len(text) > args.max_length:
+            if args.max_length > 0 and len(text) > args.max_length:
                 skipped_too_long += 1
                 continue
             
@@ -93,8 +97,13 @@ def main():
         
         print()
         print(f"✓ Collected {len(examples):,} math word problems")
-        print(f"  Skipped {skipped_too_short:,} too short (< {args.min_length} chars)")
-        print(f"  Skipped {skipped_too_long:,} too long (> {args.max_length} chars)")
+        if args.min_length > 0 or args.max_length > 0:
+            if args.min_length > 0:
+                print(f"  Skipped {skipped_too_short:,} too short (< {args.min_length} chars)")
+            if args.max_length > 0:
+                print(f"  Skipped {skipped_too_long:,} too long (> {args.max_length} chars)")
+        else:
+            print(f"  ✓ No length filtering applied - kept all sequences")
         print()
         
         # Calculate average length
