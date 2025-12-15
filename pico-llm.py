@@ -21,6 +21,10 @@ def parse_args():
                         help="Optional list of text files to mix in as data sources. Each line is one example (up to block_size).")
     parser.add_argument("--tinystories_weight", type=float, default=0.5,
                         help="Probability of sampling from TinyStories if present. Default=0.5. (set to 0.0 to skip TinyStories).")
+    parser.add_argument("--use_gsm8k", action="store_true",
+                        help="Include GSM8K math word problems for training.")
+    parser.add_argument("--gsm8k_subset_size", type=int, default=10000,
+                        help="Number of GSM8K train examples to load (for speed). Default=10000.")
     parser.add_argument("--max_steps_per_epoch", type=int, default=None,
                         help="If set, each epoch ends after this many steps (for quick tests).")
     parser.add_argument("--num_inner_mlp_layers", type=int, default=1,
@@ -487,6 +491,7 @@ class TransformerModel(nn.Module):
     3. Stack of TransformerBlocks
     4. Final RMSNorm
     5. Linear projection to vocabulary: d_model -> vocab_size
+    6. Optional value head for RL (d_model -> 1)
     
     PARAMETERS:
     - vocab_size: Number of tokens in vocabulary
@@ -496,9 +501,11 @@ class TransformerModel(nn.Module):
     - block_size: Maximum sequence length (for positional embeddings)
     - ff_mult: Feedforward expansion factor (typically 4)
     - use_pos_emb: Whether to use learned positional embeddings
+    - use_value_head: Whether to attach a scalar value head (for PPO/RL)
     """
     def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, 
-                 block_size=1024, ff_mult=4, use_pos_emb=True, norm_type='pre'):
+                 block_size=1024, ff_mult=4, use_pos_emb=True, norm_type='pre',
+                 use_value_head=False):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -506,7 +513,8 @@ class TransformerModel(nn.Module):
         self.n_blocks = n_blocks
         self.block_size = block_size
         self.use_pos_emb = use_pos_emb
-        self.norm_type=norm_type
+        self.norm_type = norm_type
+        self.use_value_head = use_value_head
         
         # Embedding layers
         self.embed = nn.Embedding(vocab_size, d_model)  # Token embeddings
@@ -523,26 +531,28 @@ class TransformerModel(nn.Module):
         # Final normalization and projection
         self.final_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)  # Language model head
+        self.value_head = nn.Linear(d_model, 1) if use_value_head else None  # Scalar value for PPO
         
         # Precompute causal mask (lower-triangular matrix)
-        # Shape: (1, block_size, block_size), 1 = allowed, 0 = masked
-        causal = torch.tril(torch.ones(block_size, block_size, dtype=torch.uint8))
+        # Shape: (1, block_size, block_size), True = allowed, False = masked
+        causal = torch.tril(torch.ones(block_size, block_size, dtype=torch.bool))
         self.register_buffer("causal_mask", causal.unsqueeze(0))  # Save as non-trainable buffer
 
-    def forward(self, tokens_seq):
+    def forward(self, tokens_seq, return_value: bool = False):
         """
         Forward pass for causal language modeling.
         
         INPUT: tokens_seq (seq_len, batch_size) - Note: time-first format from DataLoader
-        OUTPUT: (seq_len, batch_size, vocab_size) - Logits for next token at each position
+        OUTPUT: logits (seq_len, batch_size, vocab_size)
+                if return_value=True and use_value_head=True, also returns values (seq_len, batch_size, 1)
         
         STEPS:
         1. Transpose to (batch, seq_len) for easier processing
         2. Embed tokens and add positional embeddings
         3. Pass through all Transformer blocks (with causal masking)
         4. Final normalization
-        5. Project to vocabulary logits
-        6. Transpose back to (seq_len, batch, vocab_size) for consistency
+        5. Project to vocabulary logits (and optional value head)
+        6. Transpose back to (seq_len, batch, ...)
         """
         seq_len, batch_size = tokens_seq.shape
         if seq_len > self.block_size:
@@ -565,10 +575,18 @@ class TransformerModel(nn.Module):
         
         # Final norm and projection
         x = self.final_norm(x)
-        logits = self.lm_head(x)  # (batch, seq_len, vocab_size)
+        logits_b = self.lm_head(x)  # (batch, seq_len, vocab_size)
+        values_b = self.value_head(x) if self.use_value_head else None  # (batch, seq_len, 1)
         
-        # Transpose back to (seq_len, batch, vocab_size) for consistency with LSTM/K-gram
-        return logits.transpose(0, 1)
+        # Transpose back to (seq_len, batch, ...)
+        logits = logits_b.transpose(0, 1)
+        values = values_b.transpose(0, 1) if values_b is not None else None
+        
+        if return_value:
+            if not self.use_value_head:
+                raise ValueError("return_value=True requires use_value_head=True")
+            return logits, values  # type: ignore
+        return logits
 
 
 ################################################################################
@@ -967,7 +985,7 @@ def main():
     # Data Loading and Tokenization
     ############################################################################
     tinystories_seqs = []  # Tokenized TinyStories data
-    other_seqs = []  # Tokenized custom file data
+    other_seqs = []  # Tokenized custom file data (and math data)
 
     # Load TinyStories dataset from HuggingFace if requested
     if args.tinystories_weight > 0.0:
@@ -993,6 +1011,24 @@ def main():
             if len(tokens) > 0:  # Skip empty sequences
                 tinystories_seqs.append(tokens)
         print(f"TinyStories sequences: {len(tinystories_seqs)}")
+
+    # Optionally load GSM8K math word problems
+    if args.use_gsm8k:
+        print(f"Loading GSM8K (subset size={args.gsm8k_subset_size})...")
+        gsm8k_ds = load_dataset("gsm8k", "main", split="train")
+        if args.gsm8k_subset_size is not None:
+            gsm8k_ds = gsm8k_ds.select(range(min(args.gsm8k_subset_size, len(gsm8k_ds))))
+        gsm8k_count = 0
+        for sample in gsm8k_ds:
+            q = sample.get("question", "")
+            a = sample.get("answer", "")
+            text = f"Question: {q}\nAnswer: {a}"
+            tokens = enc.encode(text)
+            tokens = tokens[:block_size]
+            if len(tokens) > 0:
+                other_seqs.append(tokens)
+                gsm8k_count += 1
+        print(f"GSM8K sequences: {gsm8k_count}")
 
     # Tokenize custom input files if provided
     if args.input_files:
