@@ -353,7 +353,7 @@ train_gsm8k_only() {
 }
 
 train_gsm8k() {
-  print_header "🧮 Fine-tuning on GSM8K (from base checkpoint)"
+  print_header "🧮 Fine-tuning on GSM8K (from Orca checkpoint)"
   
   # Clean old GSM8K checkpoints (default enabled)
   if [[ "$CLEAN_GSM8K_CKPT" == "1" ]]; then
@@ -385,42 +385,83 @@ train_gsm8k() {
       ;;
   esac
   
-  # Auto-detect base checkpoint (optional for backward compatibility)
+  # Auto-detect base checkpoint
+  # Priority order:
+  # 1. BASE_CKPT environment variable
+  # 2. Known Orca checkpoint: $OUTDIR/transformer_epoch8.pt (Orca-Math trained)
+  # 3. Latest transformer_epoch*.pt in $OUTDIR
+  # 4. Direct Orca model checkpoints: $OUTDIR/orca_model_*.pt
   if [[ -z "${BASE_CKPT:-}" ]]; then
-    BASE_CKPT=$(find_latest_checkpoint)
-    if [[ -z "$BASE_CKPT" ]]; then
-      echo "⚠️  No base checkpoints found in $OUTDIR/transformer_epoch*.pt"
-      echo "   Training from scratch on GSM8K (use 'gsm8k-sft' mode explicitly for clarity)"
-      echo ""
-      train_gsm8k_only
-      return
+    # First, check for the known Orca checkpoint (transformer_epoch8.pt)
+    if [[ -f "$OUTDIR/transformer_epoch8.pt" ]]; then
+      BASE_CKPT="$OUTDIR/transformer_epoch8.pt"
+      echo "✓ Using Orca checkpoint: $BASE_CKPT"
+    else
+      # Fallback to finding latest transformer_epoch*.pt
+      BASE_CKPT=$(find_latest_checkpoint "transformer_epoch*.pt")
+      
+      # If not found, try orca_model_*.pt (direct Orca checkpoints)
+      if [[ -z "$BASE_CKPT" ]]; then
+        BASE_CKPT=$(find_latest_checkpoint "orca_model_*.pt")
+        if [[ -n "$BASE_CKPT" ]]; then
+          echo "✓ Found Orca model checkpoint: $BASE_CKPT"
+        fi
+      else
+        local epoch_num=$(basename "$BASE_CKPT" .pt | sed 's/transformer_epoch//')
+        echo "✓ Auto-detected transformer checkpoint: $BASE_CKPT (epoch $epoch_num)"
+      fi
+      
+      # If still not found, train from scratch
+      if [[ -z "$BASE_CKPT" ]]; then
+        echo "⚠️  No base checkpoints found in:"
+        echo "   - $OUTDIR/transformer_epoch8.pt (Orca checkpoint)"
+        echo "   - $OUTDIR/transformer_epoch*.pt"
+        echo "   - $OUTDIR/orca_model_*.pt"
+        echo "   Training from scratch on GSM8K (use 'gsm8k-sft' mode explicitly for clarity)"
+        echo ""
+        train_gsm8k_only
+        return
+      fi
     fi
-    local epoch_num=$(basename "$BASE_CKPT" .pt | sed 's/transformer_epoch//')
-    echo "✓ Auto-detected base checkpoint: $BASE_CKPT (epoch $epoch_num)"
   else
     if [[ ! -f "$BASE_CKPT" ]]; then
       echo "❌ Base checkpoint not found: $BASE_CKPT"
       exit 1
     fi
+    echo "✓ Using specified checkpoint: $BASE_CKPT"
   fi
   
-  echo "Base checkpoint: $BASE_CKPT"
-  print_config
+  echo ""
+  echo "📊 Training Configuration:"
+  echo "  Base checkpoint: $BASE_CKPT"
+  echo "  Model size: $TRANSFORMER_SIZE"
+  echo "  Device: $DEVICE"
+  echo ""
   
   # Create finetune output directory
   local ft_dir="$OUTDIR/finetune_gsm8k"
   mkdir -p "$ft_dir"
   
-  # Adjust hyperparameters for GSM8K
-  # GSM8K is small; default to fewer epochs to reduce overfitting unless explicitly overridden.
-  EPOCHS=${EPOCHS_OVERRIDE:-${GSM8K_EPOCHS:-4}}
-  LR=${LR_OVERRIDE:-2e-4}
-  LR_WARMUP_STEPS=${WARMUP_OVERRIDE:-200}
-  LR_MIN_RATIO=0.1
+  # Improved hyperparameters for GSM8K fine-tuning from Orca
+  # These values are optimized to prevent overfitting while ensuring the model learns GSM8K reasoning
+  EPOCHS=${EPOCHS_OVERRIDE:-${GSM8K_EPOCHS:-10}}  # More epochs for better learning
+  LR=${LR_OVERRIDE:-3e-4}  # Conservative LR to preserve Orca knowledge
+  LR_WARMUP_STEPS=${WARMUP_OVERRIDE:-500}  # Longer warmup for stability
+  LR_MIN_RATIO=0.1  # Drop to 10% of peak LR by end
   
   local prompt="Q: If you have 3 apples and buy 2 more, how many apples do you have? A:"
   
-  print_header "🚀 Stage 1: Supervised Fine-tuning"
+  echo "📋 Fine-tuning Hyperparameters:"
+  echo "  Epochs: $EPOCHS"
+  echo "  Learning rate: $LR"
+  echo "  LR warmup steps: $LR_WARMUP_STEPS"
+  echo "  LR min ratio: $LR_MIN_RATIO"
+  echo "  Batch size: $BATCH"
+  echo "  Gradient clip: $GRAD_CLIP"
+  echo "  Weight decay: $WEIGHT_DECAY"
+  echo ""
+  
+  print_header "🚀 Starting Supervised Fine-tuning on GSM8K"
   python pico-llm.py \
     --enable_transformer --disable_lstm \
     --device_id "$DEVICE" \
@@ -445,11 +486,14 @@ train_gsm8k() {
   
   # Copy checkpoints with clear naming
   local sft_ckpt=""
+  local sft_final_ckpt=""
   for f in "$ft_dir"/transformer_epoch*.pt; do
     [[ -f "$f" ]] || continue
     local bn=$(basename "$f")
-    cp -f "$f" "$OUTDIR/gsm8k_${bn}"
+    local target="$OUTDIR/gsm8k_${bn}"
+    cp -f "$f" "$target"
     sft_ckpt="$f"
+    sft_final_ckpt="$target"
   done
   
   if [[ -z "$sft_ckpt" ]]; then
@@ -457,20 +501,36 @@ train_gsm8k() {
     exit 1
   fi
   
-  echo "✅ SFT complete: $sft_ckpt"
+  echo ""
+  echo "✅ SFT training complete!"
+  echo "   Final checkpoint: $sft_final_ckpt"
+  echo ""
   
   print_header "✅ GSM8K Fine-tuning Complete!"
-  echo "Checkpoints:"
-  echo "  SFT: $OUTDIR/gsm8k_transformer_epoch*.pt"
+  echo "📁 Checkpoints saved to:"
+  echo "   $OUTDIR/gsm8k_transformer_epoch*.pt"
   echo ""
-  echo "Next steps:"
-  echo "  1. Evaluate SFT model:"
-  echo "     python scripts/evaluation/eval_reasoning.py \\"
-  echo "       --checkpoint $OUTDIR/gsm8k_transformer_epoch${EPOCHS}.pt \\"
-  echo "       --device $DEVICE"
+  echo "🧪 Next Steps:"
   echo ""
-  echo "  2. Run DPO/GRPO post-training (Stage 3):"
-  echo "     bash scripts/train_dpo_grpo.sh dpo $TRANSFORMER_SIZE"
+  echo "1. Quick test inference (verify model generates sensible output):"
+  echo "   python scripts/inference_dpo.py \\"
+  echo "     --checkpoint $OUTDIR/gsm8k_transformer_epoch${EPOCHS}.pt \\"
+  echo "     --prompt 'Q: If 1 apple costs \$1, how much do 2 apples cost? A:'"
+  echo ""
+  echo "2. Full evaluation on GSM8K test set:"
+  echo "   python scripts/evaluation/eval_reasoning.py \\"
+  echo "     --checkpoint $OUTDIR/gsm8k_transformer_epoch${EPOCHS}.pt \\"
+  echo "     --device $DEVICE"
+  echo ""
+  echo "3. Run optimized DPO training (if SFT looks good):"
+  echo "   bash scripts/fast_dpo_train.sh dpo $TRANSFORMER_SIZE"
+  echo ""
+  echo "💡 Tips:"
+  echo "   - Check that generated text makes mathematical sense"
+  echo "   - Look for proper step-by-step reasoning"
+  echo "   - If model still generates nonsense, try:"
+  echo "     * Lower LR: LR_OVERRIDE=1e-4 bash scripts/train.sh gsm8k"
+  echo "     * More epochs: EPOCHS_OVERRIDE=15 bash scripts/train.sh gsm8k"
   echo ""
 }
 

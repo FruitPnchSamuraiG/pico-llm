@@ -788,8 +788,154 @@ def nucleus_sampling(logits, p=0.95):
     return int(max(0, min(chosen_idx, vocab_size - 1)))
 
 
+def generate_text_with_thinking(
+    model, enc, init_text,
+    max_thinking_tokens=800,
+    max_answer_tokens=200,
+    device="cpu",
+    top_p=None,
+    temperature=1.0,
+    repetition_penalty=1.0
+):
+    """
+    Thinking-aware text generation for reasoning models.
+    
+    Generates text in two phases:
+    1. THINKING PHASE: Generate up to max_thinking_tokens until </thinking> appears
+    2. ANSWER PHASE: Generate up to max_answer_tokens for the final answer
+    
+    This allows models to use generous thinking budgets without limiting answer quality.
+    
+    SPECIAL TOKENS:
+    - <thinking>: Marks start of reasoning (usually in prompt)
+    - </thinking>: Marks end of reasoning (model generates this)
+    - <answer>: Marks start of final answer
+    
+    EXAMPLE:
+        Input:  "Q: 2+2=? A: <thinking>"
+        Output: "1. Need to add 2 and 2\n2. 2+2=4</thinking><answer>4</answer> #### 4"
+                 |<------ up to 800 tokens ------>|<----- up to 200 tokens ---->|
+    
+    PARAMETERS:
+    - model: Neural network (Transformer recommended)
+    - enc: Tokenizer (tiktoken GPT-2 BPE)
+    - init_text: Prompt (should contain "<thinking>" to trigger thinking mode)
+    - max_thinking_tokens: Token budget for thinking phase (default: 800)
+    - max_answer_tokens: Token budget for answer phase (default: 200)
+    - device: "cpu" or "cuda:0"
+    - top_p: Nucleus sampling parameter (None for greedy)
+    - temperature: Sampling temperature (1.0 = no change)
+    - repetition_penalty: Penalize repeated tokens
+    
+    RETURNS:
+    - (final_text, phase_info) where phase_info contains:
+        {
+            "thinking_tokens": int,
+            "answer_tokens": int,
+            "phase_switch": bool  # True if </thinking> was generated
+        }
+    """
+    # Special tokens
+    THINKING_START = "<thinking>"
+    THINKING_END = "</thinking>"
+    ANSWER_START = "<answer>"
+    
+    # Encode special tokens
+    thinking_end_tokens = enc.encode(THINKING_END)
+    
+    was_training = model.training
+    model.eval()
+    
+    with torch.no_grad():
+        context_tokens = enc.encode(init_text)
+        
+        # Determine initial phase based on prompt
+        prompt_text = init_text.lower()
+        if THINKING_START.lower() in prompt_text:
+            phase = "thinking"
+        else:
+            phase = "answer"  # No thinking mode
+        
+        thinking_count = 0
+        answer_count = 0
+        phase_switched = False
+        
+        block_size = getattr(model, 'block_size', None)
+        max_total_tokens = max_thinking_tokens + max_answer_tokens
+        
+        for step_i in range(max_total_tokens):
+            # Check phase limits
+            if phase == "thinking" and thinking_count >= max_thinking_tokens:
+                # Force close thinking block
+                for token in thinking_end_tokens:
+                    context_tokens.append(token)
+                phase = "answer"
+                phase_switched = True
+                thinking_count = 0
+                continue
+            
+            if phase == "answer" and answer_count >= max_answer_tokens:
+                break  # Done generating
+            
+            # Truncate context to fit block_size
+            if block_size is not None and len(context_tokens) >= block_size:
+                context_tokens = context_tokens[-(block_size - 1):]
+            
+            # Forward pass
+            seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1)
+            logits_seq = model(seq_tensor)
+            next_logits = logits_seq[-1, 0, :]
+            
+            # Apply temperature
+            if temperature != 1.0:
+                next_logits = next_logits / temperature
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                for token in set(context_tokens[-50:]):
+                    if token < len(next_logits):
+                        next_logits[token] /= repetition_penalty
+            
+            # Sample next token
+            vocab_size = enc.n_vocab
+            if top_p is None:
+                chosen_token = int(torch.argmax(next_logits).item())
+            else:
+                chosen_token = nucleus_sampling(next_logits, p=top_p)
+            
+            chosen_token = max(0, min(chosen_token, vocab_size - 1))
+            context_tokens.append(chosen_token)
+            
+            # Update phase counters
+            if phase == "thinking":
+                thinking_count += 1
+            else:
+                answer_count += 1
+            
+            # Check for phase transition (</thinking> token sequence)
+            if phase == "thinking" and len(context_tokens) >= len(thinking_end_tokens):
+                # Check if we just generated </thinking>
+                recent_tokens = context_tokens[-len(thinking_end_tokens):]
+                if recent_tokens == thinking_end_tokens:
+                    phase = "answer"
+                    phase_switched = True
+                    answer_count = 0  # Reset counter for answer phase
+    
+    model.train(was_training)
+    
+    final_text = enc.decode(context_tokens)
+    phase_info = {
+        "thinking_tokens": thinking_count,
+        "answer_tokens": answer_count,
+        "phase_switched": phase_switched
+    }
+    
+    return final_text, phase_info
+
+
 def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
                   top_p=None,
+                  repetition_penalty=1.0,
                   monosemantic_info=None,
                   do_monosemantic=False):
     """
@@ -834,9 +980,16 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
         # Tokenize initial prompt
         context_tokens = enc.encode(init_text)
         annotation_list = []
+        
+        # Get block_size from model if available (for Transformer)
+        block_size = getattr(model, 'block_size', None)
 
         # Generate tokens one at a time (autoregressive)
         for step_i in range(max_new_tokens):
+            # Truncate context to fit within block_size (if model has one)
+            if block_size is not None and len(context_tokens) >= block_size:
+                context_tokens = context_tokens[-(block_size - 1):]
+            
             # Convert token list to tensor: (seq_len, 1)
             seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1)
             
@@ -845,6 +998,12 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
             
             # Extract logits for next token (at last position)
             next_logits = logits_seq[-1, 0, :]  # (vocab_size,)
+            
+            # Apply repetition penalty (penalize recently generated tokens)
+            if repetition_penalty != 1.0:
+                for token in set(context_tokens[-50:]):  # Last 50 tokens
+                    if token < len(next_logits):
+                        next_logits[token] /= repetition_penalty
 
             # Sample next token
             vocab_size = enc.n_vocab

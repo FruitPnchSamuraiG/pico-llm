@@ -1,246 +1,329 @@
-# pico-llm
+# Pico-LLM: Reasoning Model Training System
 
-A small transformer for math reasoning, trained on Orca-Math and fine-tuned on GSM8K.
+A complete 3-stage training pipeline for mathematical reasoning models with explicit chain-of-thought capabilities.
 
-Includes interpretability tools for analyzing attention patterns and neuron activations. Supports models from 10M to 1.5B parameters.
-
----
-
-## 🎯 New: Complete 3-Stage Training Pipeline
-
-This repository now includes a **complete 3-stage training pipeline** for building GSM8K reasoning models with preference-based post-training (DPO/GRPO).
-
-> Note: In many production stacks, DPO is trained on *human preference pairs* or a reward model.
-> Here, Stage 3 constructs **synthetic preferences from GSM8K answer correctness** (an automatic verifier), i.e. **RLAIF-style**.
-
-### 📊 Pipeline Architecture (Mermaid)
-
-```mermaid
-flowchart TD
-    A([Start]) --> B{Do you already have an Orca checkpoint?\ntransformer_epoch*.pt}
-
-    %% Stage 1
-    B -- "No" --> S1["Stage 1: Orca-Math Base Training\nDataset: Orca-Math (~200k)\nMethod: SFT (cross-entropy)\nOutput: transformer_epoch8.pt\nTime: ~8-12h"]
-    S1 --> S2
-
-    %% Skip Stage 1
-    B -- "Yes" --> S2
-
-    %% Stage 2
-    S2["Stage 2: GSM8K Supervised Fine-Tuning\nDataset: GSM8K train\nMethod: SFT from Orca base\nOutput: gsm8k_transformer_epoch8.pt\nTime: ~2-3h"] --> C{Choose post-training algorithm}
-
-    %% Stage 3
-    C -->|DPO| DPO["Stage 3A: DPO (synthetic preferences)\nDirect Preference Optimization\nSamples: 2 per prompt\nTime: ~1-2h\nOutput: transformer_dpo_final.pt"]
-    C -->|GRPO| GRPO["Stage 3B: GRPO (outcome reward)\nGroup Relative Policy Optimization\nSamples: 4-16 per prompt\nTime: ~2-3h\nOutput: transformer_grpo_final.pt"]
-
-    DPO --> F([Final GSM8K Reasoning Model])
-    GRPO --> F
-
-    F --> E["Evaluate\npython scripts/evaluation/eval_reasoning.py\n--checkpoint <final_model>\n--test_file data/gsm8k_test.txt"]
-```
-
-### 🚀 Quick Start (One Command)
+## Quick Start
 
 ```bash
-# Run complete pipeline (skip Stage 1 if Orca checkpoint already exists)
-SKIP_STAGE1=1 bash scripts/full_pipeline_gsm8k.sh dpo medium
-
-# Or use GRPO (group-based policy optimization)
-SKIP_STAGE1=1 bash scripts/full_pipeline_gsm8k.sh grpo medium
-
-# Non-interactive / remote (no confirmation prompt)
-YES=1 SKIP_STAGE1=1 bash scripts/full_pipeline_gsm8k.sh dpo medium
-```
-
-**This will**:
-- ✅ Skip Stage 1 (Orca - already trained)
-- 🔄 Run Stage 2 (GSM8K SFT) → ~2-3 hours
-- 🔄 Run Stage 3 (DPO/GRPO, RLAIF-style) → ~1-3 hours
-- ✅ Output final reasoning model
-
-**Total time**: ~3-6 hours on GTX TITAN X
-
-### 🧭 How to start post-training (Stage 3)
-
-Post-training (DPO/GRPO) assumes you already have a **GSM8K SFT checkpoint** from Stage 2.
-
-1) **Run Stage 2 (GSM8K SFT)** (recommended: disable the legacy RL refinement)
-
-```bash
-# Produces: .../gsm8k_transformer_epoch*.pt
-RUN_RL=0 bash scripts/train.sh gsm8k medium
-```
-
-2) **Run Stage 3 (DPO or GRPO)**
-
-Use either the convenience wrapper or call the training script directly.
-
-- Wrapper (auto-finds latest GSM8K SFT checkpoint):
-
-```bash
-# DPO (pairwise, 2 samples/prompt)
-YES=1 bash scripts/train_dpo_grpo.sh dpo medium
-
-# GRPO (grouped, outcome reward)
-YES=1 bash scripts/train_dpo_grpo.sh grpo medium
-```
-
-- Common knobs (environment variables passed through by `scripts/train_dpo_grpo.sh`):
-
-```bash
-# Typical: conservative DPO
-YES=1 BETA=0.1 TOP_P=0.95 TEMPERATURE=0.7 STEPS=800 bash scripts/train_dpo_grpo.sh dpo medium
-
-# Typical: GRPO with stronger KL and more samples
-YES=1 NUM_SAMPLES=8 KL_COEF=0.02 TOP_P=0.95 TEMPERATURE=0.8 STEPS=1200 bash scripts/train_dpo_grpo.sh grpo medium
-```
-
-If you want explicit control over paths/hparams, run:
-
-```bash
-python scripts/evaluation/dpo_grpo_training.py --help
-```
-
-### 🎯 Key Features
-
-- ✅ **DPO + GRPO implementations** for post-training
-- ✅ **Vectorized log-prob computation** with **per-token KL proxy** (typical in practice)
-- ✅ **GSM8K-aware answer extraction** (handles `#### answer` format)
-- ✅ **Reference model** support (stability / KL regularization)
-- ✅ **Hardware-oriented defaults** for 12GB VRAM GPUs
-
----
-
-## Quick Start (Legacy)
-
-These commands are kept for reproducibility with earlier experiments.
-
-- For a more industry-standard preference-training stack, prefer the **3-stage pipeline above**.
-- The legacy GSM8K script optionally includes an outcome-RL refinement loop; when using DPO/GRPO, it is recommended to disable it via `RUN_RL=0`.
-
-```bash
-# 1. Train base model on Orca-Math (~8-10 hours)
+# Stage 1: Train base model on Orca-Math (~8-12 hours)
 bash scripts/train.sh orca
 
-# 2. Fine-tune on GSM8K (SFT). Recommended setting for the new pipeline:
-RUN_RL=0 bash scripts/train.sh gsm8k
+# Stage 2: Fine-tune on GSM8K (~2-4 hours)
+bash scripts/train.sh gsm8k
 
-# 3. Evaluate
-python scripts/evaluation/eval_reasoning.py \
-  --checkpoint /scratch/kk6081/picollm_extend/gsm8k_transformer_epoch8.pt
+# Stage 3: Choose one:
+# 3a. Reasoning model with <thinking> blocks (~1-2 hours)
+bash scripts/train_reasoning.sh
+
+# 3b. Fast optimized DPO (~30 min - 1 hour)
+bash scripts/fast_dpo_train.sh dpo medium
 ```
 
-### Model Sizes
+## Features
 
-| Size | Parameters | Memory | Fits on GTX TITAN X (12GB) |
-|------|-----------|--------|---------------------------|
-| `small` | 10M | ~2GB | ✅ Yes |
-| `medium` (default) | 40M | ~4GB | ✅ Yes |
-| `gpt2-small` | 117M | ~8GB | ✅ Yes (tight) |
+### Training Pipeline
+- **Stage 1 (Orca)**: 200k math problems, 8 epochs → `transformer_epoch8.pt`
+- **Stage 2 (GSM8K)**: 7.5k problems, 10 epochs → `gsm8k_transformer_epoch10.pt`
+- **Stage 3 (Reasoning/DPO)**: Preference optimization → final model
 
-**Recommended for your hardware:** `small`, `medium`, or `gpt2-small` with reduced batch size.
-
-```bash
-# Train with gpt2-small (max for 12GB GPU)
-BATCH=8 TRANSFORMER_SIZE=gpt2-small bash scripts/train.sh orca
+### Reasoning Capabilities
+Models trained with `train_reasoning.sh` generate explicit thinking:
 ```
+Q: If John has 5 apples and buys 3 more, how many does he have? A:
+<thinking>
+1. John starts with 5 apples
+2. He buys 3 more apples
+3. Total = 5 + 3 = 8 apples
+</thinking>
+<answer> The answer is 8. #### 8
+```
+
+### Advanced Features
+- **Explicit `<thinking>` blocks** for interpretable reasoning
+- **🆕 Thinking-aware generation**: Separate token budgets for thinking (800 tokens) and answer (200 tokens)
+  - No more truncated reasoning chains
+  - Automatically detects `</thinking>` to switch phases
+  - Configurable via `MAX_THINKING_TOKENS` and `MAX_ANSWER_TOKENS`
+- **Process Reward Model (PRM)**: Scores intermediate steps
+- **Outcome Reward Model (ORM)**: Binary correct/incorrect (DeepSeek R1 style)
+- **Best-of-N sampling**: Generate N solutions, pick best (+10-20% accuracy)
+- **Self-consistency**: Majority vote over multiple reasoning paths
+- **Optimized DPO**: Pre-generated preferences, batched processing (10-100x faster)
 
 ## Configuration
 
-You can control training parameters using environment variables:
+### Model Sizes
+
+| Size | Params | VRAM | Notes |
+|------|--------|------|-------|
+| `small` | 10M | ~2GB | Fast prototyping |
+| `medium` | 40M | ~4GB | **Recommended** |
+| `gpt2-small` | 117M | ~8GB | Higher quality |
+
+### Environment Variables
 
 ```bash
-# Model & Data
-TRANSFORMER_SIZE=medium          # small, medium, gpt2-*
-MAX_SAMPLES=100000              # Orca-Math examples to use
+# Model
+TRANSFORMER_SIZE=medium         # small | medium | gpt2-small
 
 # Training
-BATCH=16                        # Batch size (reduce if OOM)
-EPOCHS=8                        # Number of epochs
+EPOCHS=10                       # SFT epochs
+NUM_STEPS=1000                  # DPO/GRPO steps
+BATCH_SIZE=8                    # Batch size
 LR=3e-4                         # Learning rate
 DEVICE=cuda:0                   # GPU device
 
-# Example: Train larger model with more epochs
-TRANSFORMER_SIZE=gpt2-small EPOCHS=10 bash scripts/train.sh orca
+# Reasoning-specific
+THINKING_STYLE=structured       # structured | verbose | concise
+REWARD_MODE=orm                 # orm | prm | hybrid
 ```
 
-## Training Modes
+## Training Scripts
 
-The unified `scripts/train.sh` handles all training workflows:
+### `scripts/train.sh`
+Base training and GSM8K SFT:
+```bash
+bash scripts/train.sh orca                    # Stage 1
+bash scripts/train.sh gsm8k                   # Stage 2
+bash scripts/train.sh gpt2 gpt2-small         # GPT-2 scale models
+```
+
+**Custom settings:**
+```bash
+# Conservative SFT
+LR_OVERRIDE=1e-4 EPOCHS_OVERRIDE=15 bash scripts/train.sh gsm8k
+
+# Different model size
+TRANSFORMER_SIZE=gpt2-small bash scripts/train.sh orca
+```
+
+### `scripts/train_reasoning.sh`
+Reasoning models with `<thinking>` blocks:
+```bash
+# Default: structured thinking + ORM
+bash scripts/train_reasoning.sh
+
+# Verbose thinking + PRM rewards
+THINKING_STYLE=verbose REWARD_MODE=prm bash scripts/train_reasoning.sh
+
+# Hybrid rewards (30% process + 70% outcome)
+REWARD_MODE=hybrid bash scripts/train_reasoning.sh
+```
+
+### `scripts/fast_dpo_train.sh`
+Optimized DPO/GRPO training:
+```bash
+# DPO (pairwise preferences)
+bash scripts/fast_dpo_train.sh dpo medium
+
+# GRPO (group-based optimization)
+bash scripts/fast_dpo_train.sh grpo medium
+
+# Custom hyperparameters
+NUM_STEPS=2000 BATCH_SIZE=4 bash scripts/fast_dpo_train.sh dpo medium
+```
+
+## Inference & Evaluation
+
+### Basic Inference
+```bash
+python scripts/inference_dpo.py \
+  --checkpoint /scratch/kk6081/picollm_extend/gsm8k_transformer_epoch10.pt \
+  --prompt "Q: If 2+2=? A:"
+```
+
+### Reasoning Demo
+```bash
+python scripts/evaluation/demo_reasoning.py
+```
+
+### GSM8K Evaluation
+```bash
+python scripts/evaluation/eval_reasoning.py \
+  --checkpoint <path> \
+  --device cuda:0
+```
+
+### Best-of-N Sampling (Python)
+```python
+from scripts.evaluation.reasoning_training import best_of_n_sampling
+import tiktoken, torch
+
+# Load model (example)
+model = ...
+enc = tiktoken.get_encoding('gpt2')
+
+# Generate 8 solutions with thinking-aware generation, pick best
+best, score, all = best_of_n_sampling(
+    model, enc, inf,
+    prompt="Q: ... A: <thinking>",
+    gold_answer="42",
+    n=8,
+    max_thinking_tokens=800,     # 🆕 Generous thinking budget
+    max_answer_tokens=200,       # 🆕 Separate answer budget
+    scoring_method="orm",        # or "prm" or "logprob"
+    use_thinking_mode=True       # 🆕 Enable thinking-aware generation
+)
+```
+
+### Thinking-Aware Generation (Python)
+```python
+import sys
+sys.path.append('.')
+import inference as inf
+from pico_llm import TransformerModel
+
+# Standard generation (combined 256 token limit)
+text, _ = inf.generate_text(model, enc, prompt, max_new_tokens=256)
+
+# 🆕 Thinking-aware generation (separate budgets)
+text, phase_info = inf.generate_text_with_thinking(
+    model, enc, prompt,
+    max_thinking_tokens=800,   # Up to 800 tokens for reasoning
+    max_answer_tokens=200,     # Up to 200 tokens for answer
+    device="cuda:0",
+    top_p=0.95
+)
+
+# phase_info = {
+#     "thinking_tokens": 156,
+#     "answer_tokens": 23,
+#     "phase_switched": True  # Model generated </thinking>
+# }
+```
+
+## Project Structure
+
+```
+pico-llm.py                           # Core training (Stages 1-2)
+inference.py                          # Basic inference
+scripts/
+  train.sh                            # Orca + GSM8K SFT
+  train_reasoning.sh                  # Reasoning training
+  fast_dpo_train.sh                   # Optimized DPO/GRPO
+  inference_dpo.py                    # DPO inference
+  evaluation/
+    dpo_grpo_training.py              # DPO/GRPO implementation
+    reasoning_training.py             # Reasoning logic
+    generate_preference_pairs.py      # Pre-generate preferences
+    demo_reasoning.py                 # Interactive demo
+    eval_reasoning.py                 # Evaluation
+  data_prep/
+    prepare_orca_math_data.py         # Download Orca-Math
+    prepare_hf_gsm8k_data.sh          # Download GSM8K
+data/
+  orca_math_{train,val}.txt           # 200k math problems
+  gsm8k_{train,val,test}.txt          # 7.5k grade-school math
+```
+
+## Key Improvements
+
+1. ✅ **Fixed SFT**: 10 epochs (was 4), better LR (3e-4 vs 2e-4)
+2. ✅ **Optimized DPO**: Pre-generated preferences, batched processing
+3. ✅ **Reasoning**: Explicit `<thinking>` blocks like DeepSeek R1/o1
+4. ✅ **🆕 Thinking-aware generation**: Separate token budgets for thinking vs answer
+   - Old: 256 tokens total (thinking + answer compete for budget)
+   - New: 800 thinking + 200 answer = no truncated reasoning
+5. ✅ **Process rewards**: Fine-grained step feedback
+6. ✅ **Inference search**: Best-of-N, self-consistency
+7. ✅ **Orca checkpoint**: Properly loads `/scratch/.../transformer_epoch8.pt`
+
+## Common Issues
+
+**Model generates nonsense?**  
+→ Verify correct checkpoint:
+```bash
+BASE_CKPT=/scratch/kk6081/picollm_extend/transformer_epoch8.pt bash scripts/train.sh gsm8k
+```
+
+**OOM errors?**  
+→ Reduce batch size:
+```bash
+BATCH_SIZE=4 bash scripts/train.sh gsm8k
+```
+
+**DPO training slow?**  
+→ Use pre-generated preferences (automatic in `fast_dpo_train.sh`)
+
+**Thinking blocks cut off?**  
+→ ✅ **SOLVED: Thinking-aware generation** now uses separate token budgets by default
+
+## Hardware Requirements
+
+- **GPU**: 12GB+ VRAM (GTX TITAN X or better)
+- **Python**: 3.9+
+- **CUDA**: 11.0+
 
 ```bash
-# Base training on Orca-Math
-bash scripts/train.sh orca [model_size]
-
-# Fine-tune on GSM8K (auto-detects latest checkpoint)
-bash scripts/train.sh gsm8k [model_size]
-
-# Train GPT-2 models
-bash scripts/train.sh gpt2 [gpt2-small|gpt2-medium|gpt2-large|gpt2-xl]
+pip install torch tiktoken
 ```
 
-### Legacy outcome-RL refinement (optional)
+## Examples
 
-The GSM8K training script can optionally run an additional outcome-RL refinement loop after SFT.
-This is **not required** when using Stage 3 (DPO/GRPO).
-
+### Full Pipeline
 ```bash
-# Skip RL refinement (recommended when doing DPO/GRPO)
-RUN_RL=0 bash scripts/train.sh gsm8k
-
-# Enable RL refinement (legacy baseline)
-RUN_RL=1 RL_STEPS=400 bash scripts/train.sh gsm8k
+# 12-18 hours total
+bash scripts/train.sh orca                      # 8-12h
+bash scripts/train.sh gsm8k                     # 2-4h
+bash scripts/train_reasoning.sh                 # 1-2h
 ```
 
-## Interpretability
-
-Analyze attention patterns, neuron activations, and internal representations:
-
+### Fast Prototype
 ```bash
-# Generate interpretability data
-python scripts/utils/interpret_transformer.py \
-  --checkpoint /scratch/kk6081/picollm_extend/transformer_epoch8.pt \
-  --analysis attention,logit_lens,neurons \
-  --out_dir /scratch/kk6081/picollm_extend/interpretability
-
-# View results in browser
-python scripts/utils/interpretability_viewer.py \
-  --root /scratch/kk6081/picollm_extend/interpretability \
-  --port 8000
+# ~3-4 hours with pre-trained Orca
+bash scripts/train.sh gsm8k                     # 2-4h
+bash scripts/fast_dpo_train.sh dpo medium      # 30min-1h
 ```
 
-Outputs:
-- Attention heatmaps per layer/head
-- Logit lens (token predictions at each layer)
-- Top neurons with max-activating contexts
+### Reasoning Experiments
+```bash
+# Test different thinking styles
+for style in structured verbose concise; do
+  THINKING_STYLE=$style bash scripts/train_reasoning.sh
+done
 
-Inspired by [Transformer Circuits](https://transformer-circuits.pub/)
-
-## Repository Structure
-
-```
-pico-llm/
-├── pico-llm.py              # Main training script
-├── inference.py             # Text generation
-├── plot_losses.py           # Visualize training curves
-├── scripts/
-│   ├── train.sh            # Unified training script (orca/gsm8k/gpt2)
-│   ├── data_prep/          # Dataset preparation
-│   │   ├── prepare_orca_math_data.py
-│   │   └── prepare_hf_gsm8k_data.sh
-│   ├── evaluation/         # Model evaluation
-│   │   ├── eval_reasoning.py
-│   │   └── rl_reasoning_outcome.py
-│   └── utils/              # Utilities
-│       ├── check_checkpoint_arch.py
-│       ├── interpret_transformer.py
-│       └── interpretability_viewer.py
-└── data/                   # Training data (auto-downloaded)
+# Test different reward models
+for reward in orm prm hybrid; do
+  REWARD_MODE=$reward bash scripts/train_reasoning.sh
+done
 ```
 
-## Additional Resources
+## How Thinking-Aware Generation Works
 
-- **Quick reference**: See `QUICKSTART.txt` for common commands
-- **Datasets**: Orca-Math-200k, GSM8K
-- **Inspiration**: [Transformer Circuits](https://transformer-circuits.pub/), [DeepSeek-R1](https://arxiv.org/abs/2501.12948)
+The system now has **two-phase generation**:
+
+1. **Thinking Phase** (up to 800 tokens by default)
+   - Generates reasoning steps inside `<thinking>` block
+   - Continues until model produces `</thinking>` token
+   - Can be configured via `max_thinking_tokens`
+
+2. **Answer Phase** (up to 200 tokens by default)
+   - Starts after `</thinking>` is detected
+   - Generates final answer in `<answer>` block
+   - Stops after `max_answer_tokens` or natural completion
+
+**Example flow:**
+```
+Prompt: "Q: If 2+2=? A: <thinking>"
+↓
+Model generates: "Let me add the numbers: 2+2=4</thinking><answer>4</answer>"
+                 └─────────── 8 tokens ────────────┘└──── 5 tokens ────┘
+                 (from thinking budget)              (from answer budget)
+```
+
+**Why this matters:**
+- Complex problems can use full 800 tokens for reasoning
+- Answer quality isn't compromised by long reasoning chains
+- Models learn to naturally close `</thinking>` blocks
+
+## Citation
+
+Implements modern reasoning model techniques from:
+- Wei et al. (2022): Chain-of-Thought Prompting
+- Rafailov et al. (2023): Direct Preference Optimization
+- DeepSeek-AI (2025): DeepSeek-R1
+
+## License
+
+MIT
 

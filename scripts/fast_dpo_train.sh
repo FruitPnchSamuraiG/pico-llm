@@ -122,16 +122,16 @@ echo ""
 OUT_DIR="$OUTDIR/${MODE}_gsm8k_${MODEL_SIZE}_fast"
 mkdir -p "$OUT_DIR"
 
-# Batch sizes (can be MUCH larger without generation overhead)
+# Batch sizes (tuned for 12GB GPU with batched forward passes)
 case "$MODEL_SIZE" in
   small)
-    BATCH=${BATCH:-32}  # Can increase significantly
+    BATCH=${BATCH:-16}  # Conservative for small model
     ;;
   medium)
-    BATCH=${BATCH:-64}  # Much larger batches possible
+    BATCH=${BATCH:-8}   # Safe for 12GB GPU (512d, 6L model)
     ;;
   gpt2-small)
-    BATCH=${BATCH:-16}  # Conservative for 12GB GPU
+    BATCH=${BATCH:-4}   # Very conservative for larger model (768d, 12L)
     ;;
   *)
     echo "❌ Unsupported model size: $MODEL_SIZE"
@@ -140,8 +140,9 @@ case "$MODEL_SIZE" in
 esac
 
 echo "🚀 Starting ${MODE^^} training with pre-generated pairs..."
-echo "   Batch size: $BATCH (much larger possible without generation!)"
+echo "   Batch size: $BATCH"
 echo "   Steps: $NUM_STEPS"
+echo "   Note: Batch processes 2x sequences (chosen + rejected per example)"
 echo ""
 
 if [ "$MODE" == "dpo" ]; then

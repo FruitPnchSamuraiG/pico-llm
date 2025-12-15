@@ -487,6 +487,8 @@ def _evaluate_model_accuracy(
             prompt, gold = split_qa(ln)
             if not gold:
                 continue
+            
+            # Generate completion
             text, _ = inf.generate_text(
                 model,
                 enc,
@@ -495,6 +497,8 @@ def _evaluate_model_accuracy(
                 device=str(device),
                 top_p=top_p,
             )
+            
+            # Extract answer for evaluation
             pred = extract_answer(text)
             total += 1
             if pred == gold:

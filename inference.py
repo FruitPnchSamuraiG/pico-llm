@@ -35,6 +35,7 @@ KGramMLPSeqModel = pico_llm.KGramMLPSeqModel
 LSTMSeqModel = pico_llm.LSTMSeqModel
 TransformerModel = pico_llm.TransformerModel
 generate_text = pico_llm.generate_text
+generate_text_with_thinking = pico_llm.generate_text_with_thinking
 nucleus_sampling = pico_llm.nucleus_sampling
 
 
