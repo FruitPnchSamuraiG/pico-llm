@@ -577,7 +577,60 @@ class TransformerModel(nn.Module):
 
 
 def monosemantic_analysis_for_token(token_id, model, monosemantic_info, enc, device="cpu", top_n=5):
-    return []
+    """
+    Lightweight "monosemantic" analysis based on nearest neighbours in embedding space.
+
+    IDEA:
+    - Treat each token's embedding (or LM head row) as a point in feature space.
+    - For a generated token, find the top-N most similar tokens by cosine similarity.
+    - This gives a quick, interpretable sense of "what feature" that token is activating.
+
+    EXPECTED STRUCTURE OF monosemantic_info:
+    - None: we compute normalized embeddings on the fly from the model.
+    - dict with key "embeddings": a (vocab_size, dim) tensor of row-normalized embeddings.
+
+    RETURNS:
+    - List of (similarity, neighbor_token_id) pairs, sorted by descending similarity.
+    """
+    # If we weren't given any precomputed info, try to build it from the model.
+    if (monosemantic_info is None) or ("embeddings" not in monosemantic_info):
+        with torch.no_grad():
+            base_emb = None
+            # Prefer token embeddings if present.
+            if hasattr(model, "embed") and hasattr(model.embed, "weight"):
+                base_emb = model.embed.weight
+            elif hasattr(model, "embedding") and hasattr(model.embedding, "weight"):
+                base_emb = model.embedding.weight
+            elif hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
+                base_emb = model.lm_head.weight
+
+            if base_emb is None:
+                # Model doesn't expose a standard embedding matrix; give up gracefully.
+                return []
+
+            # Row-normalize so dot products become cosine similarities.
+            emb = F.normalize(base_emb.detach().to(device), dim=-1)
+    else:
+        emb = monosemantic_info["embeddings"].to(device)
+
+    vocab_size, _ = emb.shape
+    token_id = int(token_id)
+    if token_id < 0 or token_id >= vocab_size:
+        return []
+
+    with torch.no_grad():
+        # Embeddings are already normalized, so this is cosine similarity.
+        token_vec = emb[token_id]  # (dim,)
+        sims = emb @ token_vec     # (vocab_size,)
+
+        # Exclude the token itself.
+        sims[token_id] = -1e9
+
+        k = min(top_n, vocab_size - 1)
+        top_vals, top_ids = torch.topk(sims, k=k, dim=0)
+
+    neighbors = [(float(score), int(idx)) for score, idx in zip(top_vals.tolist(), top_ids.tolist())]
+    return neighbors
 
 
 ################################################################################
@@ -1106,6 +1159,24 @@ def main():
     
     for model_name, model in models.items():
         print(f"\n=== Training model: {model_name} ===")
+
+        # Optional: precompute monosemantic embedding info per model if requested.
+        monosemantic_info = None
+        if args.monosemantic_enabled:
+            with torch.no_grad():
+                base_emb = None
+                # Prefer token embeddings if present; otherwise fall back to LM head.
+                if hasattr(model, "embed") and hasattr(model.embed, "weight"):
+                    base_emb = model.embed.weight
+                elif hasattr(model, "embedding") and hasattr(model.embedding, "weight"):
+                    base_emb = model.embedding.weight
+                elif hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
+                    base_emb = model.lm_head.weight
+
+                if base_emb is not None:
+                    emb = F.normalize(base_emb.detach(), dim=-1)
+                    monosemantic_info = {"embeddings": emb}
+
         train_history, val_history = train_one_model(
             model=model,
             loader=train_loader,
@@ -1118,6 +1189,7 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
+            monosemantic_info=monosemantic_info,
             prompt=args.prompt,  # user-specified prompt here
             val_loader=val_loader  # Pass validation loader
         )
@@ -1134,16 +1206,22 @@ def main():
             text_greedy, ann_greedy = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=str(device),
                 top_p=None,
+                monosemantic_info=monosemantic_info,
+                do_monosemantic=(monosemantic_info is not None),
             )
             # 2) top-p=0.95
             text_topp, ann_topp = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=str(device),
                 top_p=0.95,
+                monosemantic_info=monosemantic_info,
+                do_monosemantic=(monosemantic_info is not None),
             )
             # 3) top-p=1.0 => full distribution random sampling
             text_topp1, ann_topp1 = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=str(device),
                 top_p=1.0,
+                monosemantic_info=monosemantic_info,
+                do_monosemantic=(monosemantic_info is not None),
             )
 
         print(f"[{model_name}] Final sample (greedy) from prompt: '{args.prompt}'")
