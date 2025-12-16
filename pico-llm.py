@@ -268,7 +268,6 @@ def seq_collate_fn(batch):
 
 ################################################################################
 # 4. K-gram MLP: Fixed-window feedforward baseline
-#    Simplest sequence model: predict next token from last k tokens
 ################################################################################
 
 def compute_next_token_loss(logits, tokens):
@@ -505,6 +504,11 @@ class TransformerBlock(nn.Module):
     - Residual connections: Enable gradient flow through deep networks
     - RMSNorm: Stabilize activations
     
+    KV-CACHING:
+    - During generation, cache K, V tensors to avoid recomputing them
+    - Only compute K, V for new tokens and concatenate with cache
+    - Dramatically speeds up autoregressive generation (O(n) -> O(1) per token)
+    
     PARAMETERS:
     - d_model: Model dimension (embed_size)
     - n_heads: Number of attention heads (must divide d_model evenly)
@@ -539,20 +543,28 @@ class TransformerBlock(nn.Module):
         self.save_attention = False
         self.last_attn_probs = None
 
-    def forward(self, x, causal_mask=None):
+    def forward(self, x, causal_mask=None, kv_cache=None, use_cache=False):
         """
         Process sequence through attention and feedforward with residuals.
         
-        INPUT: x (batch, seq_len, d_model), causal_mask (1, max_len, max_len)
-        OUTPUT: (batch, seq_len, d_model)
+        INPUT: 
+            x (batch, seq_len, d_model) - Input sequence
+            causal_mask (1, max_len, max_len) - Causal attention mask
+            kv_cache (dict) - Optional cache containing 'k' and 'v' tensors from previous steps
+            use_cache (bool) - Whether to return updated cache for next step
         
-        MULTI-HEAD ATTENTION ALGORITHM:
+        OUTPUT: 
+            x (batch, seq_len, d_model) - Output sequence
+            new_cache (dict or None) - Updated cache if use_cache=True
+        
+        MULTI-HEAD ATTENTION ALGORITHM (with KV-caching):
         1. Normalize input
         2. Project to Q, K, V and split into n_heads
-        3. Compute scaled dot-product attention per head
-        4. Apply causal mask (prevent attending to future tokens)
-        5. Concatenate heads and project
-        6. Add residual connection
+        3. If cache exists, concatenate cached K, V with new ones
+        4. Compute scaled dot-product attention per head
+        5. Apply causal mask (prevent attending to future tokens)
+        6. Concatenate heads and project
+        7. Add residual connection
         
         FEEDFORWARD:
         1. Normalize attention output
@@ -561,7 +573,7 @@ class TransformerBlock(nn.Module):
         """
         b, t, d = x.shape
         
-        # ===== ATTENTION BLOCK =====
+        # ===== ATTENTION BLOCK (with KV-caching) =====
         if self.norm_type == 'pre':
             xa = self.norm_attn(x)  # Pre-norm: normalize BEFORE attention
         else:
@@ -573,22 +585,37 @@ class TransformerBlock(nn.Module):
         k = self.k_proj(xa).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(xa).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         
+        # KV-cache: If cache exists, concatenate with new K, V
+        if kv_cache is not None:
+            # Cache format: {'k': (batch, n_heads, cache_len, head_dim), 'v': ...}
+            k = torch.cat([kv_cache['k'], k], dim=2)  # Concatenate along sequence dimension
+            v = torch.cat([kv_cache['v'], v], dim=2)
+        
+        # Prepare cache for next step if requested
+        new_cache = None
+        if use_cache:
+            new_cache = {'k': k, 'v': v}
+        
+        # Current sequence length after concatenating with cache
+        kv_len = k.size(2)
+        
         # Scaled dot-product attention: Q @ K^T / sqrt(d_k)
-        # Shape: (batch, n_heads, seq_len, seq_len)
+        # Shape: (batch, n_heads, query_len, kv_len)
         attn_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         
         # Apply causal mask: prevent position i from attending to position j > i
         if causal_mask is not None:
-            # Slice mask to current sequence length (mask is pre-allocated for max_len)
-            attn_scores = attn_scores.masked_fill(causal_mask[:, None, :t, :t] == 0, -1e9)
+            # Slice mask to current sequence length
+            # For cached scenario: query_len=1 (new token), kv_len=cache_len+1
+            attn_scores = attn_scores.masked_fill(causal_mask[:, None, -t:, :kv_len] == 0, -1e9)
         
         # Softmax to get attention probabilities
-        attn_probs = F.softmax(attn_scores, dim=-1)  # (batch, heads, seq_len, seq_len)
+        attn_probs = F.softmax(attn_scores, dim=-1)  # (batch, heads, query_len, kv_len)
         if self.save_attention:
             self.last_attn_probs = attn_probs.detach().cpu()
         
         # Apply attention to values
-        attn_out = attn_probs @ v  # (batch, heads, seq_len, head_dim)
+        attn_out = attn_probs @ v  # (batch, heads, query_len, head_dim)
         
         # Concatenate heads and project
         attn_out = attn_out.transpose(1, 2).contiguous().view(b, t, d)
@@ -608,6 +635,8 @@ class TransformerBlock(nn.Module):
         if self.norm_type=='post':
             x = self.norm_ff(x)
         
+        if use_cache:
+            return x, new_cache
         return x
 
 
@@ -683,20 +712,31 @@ class TransformerModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, tokens_seq):
+    def forward(self, tokens_seq, kv_cache=None, use_cache=False):
         """
-        Forward pass for causal language modeling.
+        Forward pass for causal language modeling with optional KV-caching.
         
-        INPUT: tokens_seq (seq_len, batch_size) - Note: time-first format from DataLoader
-        OUTPUT: (seq_len, batch_size, vocab_size) - Logits for next token at each position
+        INPUT: 
+            tokens_seq (seq_len, batch_size) - Note: time-first format from DataLoader
+            kv_cache (list of dicts or None) - Cache for each layer, format: [{'k': tensor, 'v': tensor}, ...]
+            use_cache (bool) - Whether to return updated cache for next generation step
+        
+        OUTPUT: 
+            logits (seq_len, batch_size, vocab_size) - Logits for next token at each position
+            new_cache (list of dicts or None) - Updated cache if use_cache=True
         
         STEPS:
         1. Transpose to (batch, seq_len) for easier processing
         2. Embed tokens and add positional embeddings
-        3. Pass through all Transformer blocks (with causal masking)
+        3. Pass through all Transformer blocks (with causal masking and optional caching)
         4. Final normalization
         5. Project to vocabulary logits
         6. Transpose back to (seq_len, batch, vocab_size) for consistency
+        
+        KV-CACHING BEHAVIOR:
+        - If kv_cache is None: Normal forward pass, compute everything
+        - If kv_cache exists: Use cached K, V from previous steps, only compute for new tokens
+        - If use_cache=True: Return updated cache for next step
         """
         seq_len, batch_size = tokens_seq.shape
         if seq_len > self.block_size:
@@ -710,19 +750,39 @@ class TransformerModel(nn.Module):
         
         # Add positional embeddings if enabled
         if self.pos_emb is not None:
-            pos = torch.arange(seq_len, device=tokens_seq.device).unsqueeze(0)  # (1, seq_len)
+            # For cached generation, position starts from cache_len
+            if kv_cache is not None and len(kv_cache) > 0:
+                cache_len = kv_cache[0]['k'].size(2)  # Get cached sequence length
+                pos_start = cache_len
+            else:
+                pos_start = 0
+            
+            pos = torch.arange(pos_start, pos_start + seq_len, device=tokens_seq.device).unsqueeze(0)  # (1, seq_len)
             x = x + self.pos_emb(pos)  # Broadcast and add
         
-        # Pass through all Transformer blocks
-        for blk in self.blocks:
-            x = blk(x, causal_mask=self.causal_mask)  # Apply causal masking
+        # Pass through all Transformer blocks with optional caching
+        new_kv_cache: list = [] if use_cache else None  # type: ignore
+        
+        for i, blk in enumerate(self.blocks):
+            # Get cache for this layer if available
+            layer_cache = kv_cache[i] if (kv_cache is not None and i < len(kv_cache)) else None
+            
+            if use_cache:
+                x, updated_cache = blk(x, causal_mask=self.causal_mask, kv_cache=layer_cache, use_cache=True)
+                new_kv_cache.append(updated_cache)  # type: ignore
+            else:
+                x = blk(x, causal_mask=self.causal_mask, kv_cache=layer_cache, use_cache=False)
         
         # Final norm and projection
         x = self.final_norm(x)
         logits = self.lm_head(x)  # (batch, seq_len, vocab_size)
         
         # Transpose back to (seq_len, batch, vocab_size) for consistency with LSTM/K-gram
-        return logits.transpose(0, 1)
+        logits_out = logits.transpose(0, 1)
+        
+        if use_cache:
+            return logits_out, new_kv_cache
+        return logits_out
 
 
 ################################################################################
@@ -846,8 +906,25 @@ def generate_text_with_thinking(
     was_training = model.training
     model.eval()
     
+    # Check for KV-cache support
+    use_kv_cache = isinstance(model, TransformerModel)
+    kv_cache = None
+    
     with torch.no_grad():
         context_tokens = enc.encode(init_text)
+        
+        # Validate context tokens against model vocabulary
+        model_vocab_size = getattr(model, 'vocab_size', enc.n_vocab)
+        if hasattr(model, 'embed') and hasattr(model.embed, 'weight'):
+             model_vocab_size = model.embed.weight.shape[0]
+             
+        # Check for out-of-bounds tokens in prompt
+        if any(t >= model_vocab_size for t in context_tokens):
+            print(f"Warning: Prompt contains tokens >= model vocab size {model_vocab_size}. Clamping.")
+            context_tokens = [min(t, model_vocab_size - 1) for t in context_tokens]
+        
+        # Determine initial phase based on prompt
+        prompt_text = init_text.lower()
         
         # Determine initial phase based on prompt
         prompt_text = init_text.lower()
@@ -863,28 +940,56 @@ def generate_text_with_thinking(
         block_size = getattr(model, 'block_size', None)
         max_total_tokens = max_thinking_tokens + max_answer_tokens
         
+        # Initial forward pass
+        if use_kv_cache:
+            # Process full prompt to prime cache
+            seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1) # (seq, 1)
+            logits_seq, kv_cache = model(seq_tensor, kv_cache=None, use_cache=True)
+            next_logits = logits_seq[-1, 0, :]
+        else:
+            # Will be computed in loop
+            pass
+
         for step_i in range(max_total_tokens):
             # Check phase limits
             if phase == "thinking" and thinking_count >= max_thinking_tokens:
                 # Force close thinking block
-                for token in thinking_end_tokens:
+                tokens_to_add = thinking_end_tokens
+                for token in tokens_to_add:
                     context_tokens.append(token)
+                    if use_kv_cache:
+                        inp = torch.tensor([[token]], dtype=torch.long, device=device).transpose(0, 1) # (1, 1)
+                        _, kv_cache = model(inp, kv_cache=kv_cache, use_cache=True)
+                
                 phase = "answer"
                 phase_switched = True
                 thinking_count = 0
+                
+                # Update next_logits for the last added token
+                if use_kv_cache:
+                    seq_tensor = torch.tensor(tokens_to_add, dtype=torch.long, device=device).unsqueeze(1)
+                    logits_seq, kv_cache = model(seq_tensor, kv_cache=kv_cache, use_cache=True)
+                    next_logits = logits_seq[-1, 0, :]
+                     
                 continue
             
             if phase == "answer" and answer_count >= max_answer_tokens:
                 break  # Done generating
             
-            # Truncate context to fit block_size
-            if block_size is not None and len(context_tokens) >= block_size:
-                context_tokens = context_tokens[-(block_size - 1):]
-            
-            # Forward pass
-            seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1)
-            logits_seq = model(seq_tensor)
-            next_logits = logits_seq[-1, 0, :]
+            # Prepare input for this step
+            if use_kv_cache:
+                pass
+            else:
+                # Truncate context to fit block_size
+                if block_size is not None and len(context_tokens) >= block_size:
+                    inp_tokens = context_tokens[-(block_size - 1):]
+                else:
+                    inp_tokens = context_tokens
+                
+                # Forward pass
+                seq_tensor = torch.tensor(inp_tokens, dtype=torch.long, device=device).unsqueeze(1)
+                logits_seq = model(seq_tensor)
+                next_logits = logits_seq[-1, 0, :]
             
             # Apply temperature
             if temperature != 1.0:
@@ -893,18 +998,63 @@ def generate_text_with_thinking(
             # Apply repetition penalty
             if repetition_penalty != 1.0:
                 for token in set(context_tokens[-50:]):
-                    if token < len(next_logits):
+                    # Ensure next_logits is a tensor before indexing
+                    if isinstance(next_logits, torch.Tensor) and token < len(next_logits):
                         next_logits[token] /= repetition_penalty
             
             # Sample next token
-            vocab_size = enc.n_vocab
+            vocab_size = model_vocab_size
             if top_p is None:
-                chosen_token = int(torch.argmax(next_logits).item())
+                # Ensure next_logits is a tensor
+                if not isinstance(next_logits, torch.Tensor):
+                     # This should not happen if logic is correct, but for safety
+                     next_logits = torch.tensor(next_logits, device=device)
+                
+                # Explicitly cast to Tensor for type checker
+                logits_tensor: torch.Tensor = next_logits # type: ignore
+                chosen_token = int(torch.argmax(logits_tensor).item())
             else:
                 chosen_token = nucleus_sampling(next_logits, p=top_p)
             
             chosen_token = max(0, min(chosen_token, vocab_size - 1))
             context_tokens.append(chosen_token)
+            
+            # Update KV Cache / Compute next logits for NEXT iteration
+            if use_kv_cache:
+                inp = torch.tensor([[chosen_token]], dtype=torch.long, device=device).transpose(0, 1) # (1, 1)
+                logits_seq, kv_cache = model(inp, kv_cache=kv_cache, use_cache=True)
+                next_logits = logits_seq[-1, 0, :]
+            
+            # EARLY STOPPING: Check for token repetition (prevents !!!! spam)
+            init_len = len(enc.encode(init_text))
+            if len(context_tokens) > init_len + 10:
+                # Check last 5 tokens for repetition
+                last_5 = context_tokens[-5:]
+                if len(set(last_5)) == 1:  # All same token
+                    break
+                # Check last 10 tokens - if >7 are the same, stop
+                if len(context_tokens) >= 10:
+                    last_10 = context_tokens[-10:]
+                    most_common = max(set(last_10), key=last_10.count)
+                    if last_10.count(most_common) >= 7:
+                        break
+            
+            # Check for natural completion in answer phase
+            if phase == "answer":
+                # Decode recent output to check for completion
+                recent_text = enc.decode(context_tokens[max(0, len(context_tokens)-30):])
+                if "####" in recent_text:
+                    # Extract text after ####
+                    after_hash = recent_text.split("####")[-1].strip()
+                    if after_hash:
+                        # Stop if we see newline or repeated punctuation
+                        if '\n' in after_hash or after_hash.count('!') >= 3:
+                            break
+                        # Stop if we have a clean number followed by extra text
+                        first_word = after_hash.split()[0] if after_hash.split() else ""
+                        if first_word.replace('.','').replace('-','').isdigit():
+                            if len(after_hash) > len(first_word) + 2:
+                                break
             
             # Update phase counters
             if phase == "thinking":
@@ -933,122 +1083,107 @@ def generate_text_with_thinking(
     return final_text, phase_info
 
 
-def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
-                  top_p=None,
-                  repetition_penalty=1.0,
-                  monosemantic_info=None,
-                  do_monosemantic=False):
+def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p=None, temperature=1.0):
     """
-    Autoregressive text generation: Unified interface for all models.
+    Generate text from a prompt using the trained model.
     
-    ALGORITHM (for each new token):
-    1. Encode current text to token sequence
-    2. Feed entire sequence through model: (seq_len, 1) -> (seq_len, 1, vocab_size)
-    3. Extract logits at last position: logits[-1, 0, :]
-    4. Sample next token (greedy or top-p)
-    5. Append to sequence and repeat
-    
-    WHY FEED ENTIRE SEQUENCE?
-    - LSTM needs full context to build hidden state
-    - Transformer uses causal masking (only attends to previous positions)
-    - K-gram only uses last k tokens internally
-    - Unified interface simplifies code
-    
-    OPTIMIZATION OPPORTUNITIES:
-    - KV-caching for Transformer (reuse past attention keys/values)
-    - Hidden state passing for LSTM (don't recompute from scratch)
-    - Currently regenerates entire forward pass each step (simple but slow)
+    Supports:
+    - KV-caching for Transformer models (faster generation)
+    - Nucleus (top-p) sampling
+    - Temperature scaling
     
     PARAMETERS:
-    - model: Neural network (LSTM, Transformer, or K-gram MLP)
-    - enc: Tokenizer (tiktoken GPT-2 BPE)
-    - init_text: Prompt string to continue from
-    - max_new_tokens: How many tokens to generate
+    - model: Trained model (Transformer, LSTM, or K-gram)
+    - enc: Tokenizer (tiktoken)
+    - init_text: Prompt string
+    - max_new_tokens: Number of tokens to generate
     - device: "cpu" or "cuda:0"
-    - top_p: None for greedy (argmax), float in (0, 1] for nucleus sampling
-    - monosemantic_info: Optional interpretability data (currently unused)
-    - do_monosemantic: Whether to run interpretability analysis
+    - top_p: Nucleus sampling threshold (None for greedy)
+    - temperature: Sampling temperature (1.0 = no change)
     
     RETURNS:
-    - final_text: Full generated text (prompt + new tokens)
-    - annotated_text: Text with interpretability annotations (if enabled)
+    - generated_text: Full text (prompt + generated)
+    - tokens: List of token IDs
     """
     was_training = model.training
-    model.eval()  # Disable dropout, set batch norm to eval mode
+    model.eval()
     
-    with torch.no_grad():  # Disable gradient computation (faster, less memory)
-        # Tokenize initial prompt
+    with torch.no_grad():
         context_tokens = enc.encode(init_text)
-        annotation_list = []
         
-        # Get block_size from model if available (for Transformer)
-        block_size = getattr(model, 'block_size', None)
+        # Validate context tokens against model vocabulary
+        model_vocab_size = getattr(model, 'vocab_size', enc.n_vocab)
+        if hasattr(model, 'embed') and hasattr(model.embed, 'weight'):
+             model_vocab_size = model.embed.weight.shape[0]
 
-        # Generate tokens one at a time (autoregressive)
-        for step_i in range(max_new_tokens):
-            # Truncate context to fit within block_size (if model has one)
-            if block_size is not None and len(context_tokens) >= block_size:
-                context_tokens = context_tokens[-(block_size - 1):]
+        # Check for out-of-bounds tokens in prompt
+        if any(t >= model_vocab_size for t in context_tokens):
+            print(f"Warning: Prompt contains tokens >= model vocab size {model_vocab_size}. Clamping.")
+            context_tokens = [min(t, model_vocab_size - 1) for t in context_tokens]
+        
+        # Check if model supports KV-caching (Transformer only)
+        use_kv_cache = isinstance(model, TransformerModel)
+        kv_cache = None
+        
+        # For KV-cache, we process the full prompt once, then token-by-token
+        # For non-KV models, we re-process the full context every step
+        
+        # Initial processing
+        if use_kv_cache:
+            # Process prompt to fill cache
+            seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1) # (seq, 1)
+            logits, kv_cache = model(seq_tensor, kv_cache=None, use_cache=True)
+            next_logits = logits[-1, 0, :] # Last token's logits
+        else:
+            # Will be processed in loop
+            pass
             
-            # Convert token list to tensor: (seq_len, 1)
-            seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1)
-            
-            # Forward pass: get logits for all positions
-            logits_seq = model(seq_tensor)  # (seq_len, 1, vocab_size)
-            
-            # Extract logits for next token (at last position)
-            next_logits = logits_seq[-1, 0, :]  # (vocab_size,)
-            
-            # Apply repetition penalty (penalize recently generated tokens)
-            if repetition_penalty != 1.0:
-                for token in set(context_tokens[-50:]):  # Last 50 tokens
-                    if token < len(next_logits):
-                        next_logits[token] /= repetition_penalty
+        for _ in range(max_new_tokens):
+            # Prepare input for this step
+            if use_kv_cache and kv_cache is not None:
+                pass
+            else:
+                # Truncate context to fit block_size
+                block_size = getattr(model, 'block_size', None)
+                if block_size is not None and len(context_tokens) >= block_size:
+                    input_tokens = context_tokens[-(block_size - 1):]
+                else:
+                    input_tokens = context_tokens
+                
+                seq_tensor = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(1)
+                logits = model(seq_tensor)
+                next_logits = logits[-1, 0, :]
+
+            # Apply temperature
+            if temperature != 1.0:
+                next_logits = next_logits / temperature
 
             # Sample next token
-            vocab_size = enc.n_vocab
+            vocab_size = model_vocab_size
             if top_p is None:
-                # Greedy decoding: always pick most likely token
-                chosen_token = int(torch.argmax(next_logits).item())
+                # Greedy
+                # Ensure next_logits is a tensor
+                if not isinstance(next_logits, torch.Tensor):
+                     next_logits = torch.tensor(next_logits, device=device)
+                
+                logits_tensor: torch.Tensor = next_logits # type: ignore
+                chosen_token = int(torch.argmax(logits_tensor).item())
             else:
-                # Nucleus sampling: sample from top-p probability mass
+                # Nucleus
                 chosen_token = nucleus_sampling(next_logits, p=top_p)
-
-            # Clamp token to valid vocab range (prevents !!!!! errors)
+            
             chosen_token = max(0, min(chosen_token, vocab_size - 1))
-
-            # Append to context
             context_tokens.append(chosen_token)
-
-            # Optional: Monosemantic analysis (interpretability stub)
-            if do_monosemantic and monosemantic_info is not None:
-                neighbors = monosemantic_analysis_for_token(
-                    chosen_token, model, monosemantic_info, enc, device=device, top_n=5
-                )
-                annotation_list.append((chosen_token, neighbors))
-            else:
-                annotation_list.append((chosen_token, []))
-
-    # Restore training mode if it was on
-    model.train(was_training)
-
-    # Decode final sequence
-    final_text = enc.decode(context_tokens)
+            
+            # Prepare for next step (KV cache update)
+            if use_kv_cache:
+                inp = torch.tensor([[chosen_token]], dtype=torch.long, device=device).transpose(0, 1) # (1, 1)
+                logits, kv_cache = model(inp, kv_cache=kv_cache, use_cache=True)
+                next_logits = logits[-1, 0, :]
     
-    # Build annotated text (with interpretability info if available)
-    prefix_text = enc.decode(context_tokens[:-max_new_tokens])
-    annotated_strs = [prefix_text]
-    for (tid, neighs) in annotation_list:
-        token_str = enc.decode([tid])
-        if neighs:
-            neighbor_strs = [f"{enc.decode([x[1]])}" for x in neighs]
-            annotated = f"{token_str}[NN={neighbor_strs}]"
-        else:
-            annotated = token_str
-        annotated_strs.append(annotated)
-
-    annotated_text = "".join(annotated_strs)
-    return final_text, annotated_text
+    model.train(was_training)
+    generated_text = enc.decode(context_tokens)
+    return generated_text, context_tokens
 
 
 ################################################################################
@@ -1254,9 +1389,7 @@ def train_one_model(model,
                     print(f"\n[{model_name}] Generating sample text (greedy) at epoch={epoch}, step={batch_idx}...")
                     text_greedy, ann_greedy = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=str(device),
-                        top_p=None,  # None = greedy
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        top_p=None  # None = greedy
                     )
                     print(f" Greedy Sample: {text_greedy}")
                     print(f" Annotated: {ann_greedy}\n")
@@ -1265,9 +1398,7 @@ def train_one_model(model,
                     print(f"[{model_name}] Generating sample text (top-p=0.95) at epoch={epoch}, step={batch_idx}...")
                     text_topp, ann_topp = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=str(device),
-                        top_p=0.95,  # Keep top 95% probability mass
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        top_p=0.95  # Keep top 95% probability mass
                     )
                     print(f" Top-p (p=0.95) Sample: {text_topp}")
                     print(f" Annotated: {ann_topp}\n")
@@ -1276,9 +1407,7 @@ def train_one_model(model,
                     print(f"[{model_name}] Generating sample text (top-p=1.0) at epoch={epoch}, step={batch_idx}...")
                     text_topp1, ann_topp1 = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=str(device),
-                        top_p=1.0,  # Sample from entire distribution
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        top_p=1.0  # Sample from entire distribution
                     )
                     print(f" Top-p (p=1.0) Sample: {text_topp1}")
                     print(f" Annotated: {ann_topp1}\n")
@@ -1404,15 +1533,61 @@ def main():
         for filepath in args.input_files:
             print(f"Reading custom text file: {filepath}")
             with open(filepath, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            for line in lines:
-                line = line.strip()  # Remove whitespace
-                if not line:  # Skip empty lines
-                    continue
-                tokens = enc.encode(line)
-                tokens = tokens[:block_size]
-                if len(tokens) > 0:
-                    other_seqs.append(tokens)
+                content = f.read()
+            
+            # Check if file contains multi-line thinking blocks (look for <thinking> tags)
+            if "<thinking>" in content:
+                print(f"  Detected multi-line format with <thinking> blocks")
+                # Parse multi-line blocks: each problem starts with "Q:" and ends before next "Q:"
+                blocks = []
+                lines = content.split('\n')
+                current_block = []
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Start of new problem
+                    if line.startswith('Q:'):
+                        # Save previous block if exists
+                        if current_block:
+                            full_text = ' '.join(current_block)
+                            blocks.append(full_text)
+                        current_block = [line]
+                    else:
+                        # Continue current block
+                        current_block.append(line)
+                
+                # Don't forget last block
+                if current_block:
+                    full_text = ' '.join(current_block)
+                    blocks.append(full_text)
+                
+                print(f"  Parsed {len(blocks)} complete reasoning blocks")
+                
+                # Tokenize complete blocks
+                for block_text in blocks:
+                    tokens = enc.encode(block_text)
+                    # For thinking blocks: take LAST block_size tokens (keeps answer at end)
+                    if len(tokens) > block_size:
+                        tokens = tokens[-block_size:]
+                    if len(tokens) > 0:
+                        other_seqs.append(tokens)
+            else:
+                # Single-line format (original behavior)
+                print(f"  Using single-line format")
+                lines = content.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    tokens = enc.encode(line)
+                    if len(tokens) > block_size:
+                        tokens = tokens[-block_size:]
+                    if len(tokens) > 0:
+                        other_seqs.append(tokens)
+        
         print(f"Custom input files: {len(other_seqs)} sequences loaded.")
     else:
         print("No custom input files provided.")

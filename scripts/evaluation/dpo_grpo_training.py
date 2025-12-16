@@ -32,6 +32,16 @@ import torch.nn.functional as F
 import tiktoken
 
 import importlib.util
+import sys
+
+# Add scripts/utils to path
+sys.path.append(str(Path(__file__).parent.parent / "utils"))
+try:
+    from gsm8k_utils import extract_answer, split_qa
+except ImportError:
+    # Fallback if running from different directory
+    sys.path.append(str(Path(__file__).parent.parent.parent / "scripts" / "utils"))
+    from gsm8k_utils import extract_answer, split_qa
 
 # ============================================================================
 # Regex patterns for answer extraction (GSM8K format)
@@ -139,61 +149,6 @@ def _load_inference_module() -> Any:
     mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
     cast(Any, spec.loader).exec_module(mod)  # type: ignore[call-arg]
     return mod
-
-
-def extract_answer(text: str) -> Optional[str]:
-    """
-    Extract numerical answer from GSM8K-style text.
-    GSM8K format: "... #### 42" (answer after ####)
-    Also handles LaTeX \boxed{} and fallback to last number.
-    """
-    # Try GSM8K format first: #### answer
-    m = RE_ANSWER.search(text)
-    if m:
-        ans = m.group(1).strip()
-        # Extract just the number if there's extra text
-        nums = RE_LAST_NUMBER.findall(ans)
-        return nums[-1] if nums else ans
-    
-    # Try LaTeX \boxed{} format
-    m = RE_BOXED.search(text)
-    if m:
-        ans = m.group(1).strip()
-        nums = RE_LAST_NUMBER.findall(ans)
-        return nums[-1] if nums else ans
-    
-    # Fallback: last number in text
-    nums = RE_LAST_NUMBER.findall(text)
-    if nums:
-        return nums[-1]
-    
-    return None
-
-
-def split_qa(line: str) -> Tuple[str, str]:
-    """Split GSM8K line into (prompt, gold_answer).
-
-    Expected format: "Q: ... A: ... #### 42".
-
-    Returns:
-        prompt: prompt ending with " A:"
-        gold: extracted gold answer (string)
-    """
-    if "####" in line:
-        q_part, ans_part = line.split("####", 1)
-        # GSM8K answers can be multi-token; use numeric extraction if possible.
-        gold = extract_answer("#### " + ans_part.strip()) or ans_part.strip().split()[0]
-        prompt = q_part.strip()
-        if not prompt.endswith(" A:"):
-            prompt += " A:"
-        return prompt, gold
-
-    if " A: " in line:
-        q, rest = line.split(" A: ", 1)
-        gold = extract_answer(rest) or ""
-        return (q.strip() + " A:"), gold
-
-    return line.strip(), ""
 
 
 def _as_tensor_1xT(tokens: List[int], device: torch.device) -> torch.Tensor:

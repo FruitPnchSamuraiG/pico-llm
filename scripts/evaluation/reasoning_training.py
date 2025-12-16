@@ -28,98 +28,16 @@ import torch.nn.functional as F
 import tiktoken
 
 import importlib.util
+import sys
 
-# ============================================================================
-# Special Tokens for Reasoning
-# ============================================================================
-
-THINKING_START = "<thinking>"
-THINKING_END = "</thinking>"
-ANSWER_START = "<answer>"
-
-# These will be added to the vocabulary
-SPECIAL_TOKENS = [THINKING_START, THINKING_END, ANSWER_START]
-
-# ============================================================================
-# Answer Extraction
-# ============================================================================
-
-RE_ANSWER = re.compile(r"####\s*([^\n\r]+)")
-RE_BOXED = re.compile(r"\\boxed\{([^}]+)\}")
-RE_LAST_NUMBER = re.compile(r"([-+]?\d+(?:\.\d+)?)")
-RE_THINKING_BLOCK = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL)
-RE_ANSWER_BLOCK = re.compile(r"<answer>(.*?)(?:####|$)", re.DOTALL)
-
-
-def extract_answer(text: str) -> Optional[str]:
-    """Extract numerical answer from reasoning text."""
-    # Try GSM8K format first: #### answer
-    m = RE_ANSWER.search(text)
-    if m:
-        ans = m.group(1).strip()
-        nums = RE_LAST_NUMBER.findall(ans)
-        return nums[-1] if nums else ans
-    
-    # Try LaTeX \boxed{} format
-    m = RE_BOXED.search(text)
-    if m:
-        ans = m.group(1).strip()
-        nums = RE_LAST_NUMBER.findall(ans)
-        return nums[-1] if nums else ans
-    
-    # Fallback: last number in text
-    nums = RE_LAST_NUMBER.findall(text)
-    if nums:
-        return nums[-1]
-    
-    return None
-
-
-def extract_thinking_and_answer(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """Extract thinking block and answer from generated text.
-    
-    Returns:
-        (thinking_content, answer_content)
-    """
-    thinking = None
-    answer_text = None
-    
-    # Extract thinking block
-    m = RE_THINKING_BLOCK.search(text)
-    if m:
-        thinking = m.group(1).strip()
-    
-    # Extract answer block
-    m = RE_ANSWER_BLOCK.search(text)
-    if m:
-        answer_text = m.group(1).strip()
-    elif THINKING_END in text:
-        # Everything after </thinking> is the answer
-        answer_text = text.split(THINKING_END, 1)[-1].strip()
-    else:
-        # No thinking block, treat everything as answer
-        answer_text = text
-    
-    return thinking, answer_text
-
-
-def split_qa(line: str) -> Tuple[str, str]:
-    """Split GSM8K line into (prompt, gold_answer)."""
-    if "####" in line:
-        q_part, ans_part = line.split("####", 1)
-        gold = extract_answer("#### " + ans_part.strip()) or ans_part.strip().split()[0]
-        prompt = q_part.strip()
-        if not prompt.endswith(" A:"):
-            prompt += " A:"
-        return prompt, gold
-
-    if " A: " in line:
-        q, rest = line.split(" A: ", 1)
-        gold = extract_answer(rest) or ""
-        return (q.strip() + " A:"), gold
-
-    return line.strip(), ""
-
+# Add scripts/utils to path
+sys.path.append(str(Path(__file__).parent.parent / "utils"))
+try:
+    from gsm8k_utils import extract_answer, extract_thinking_and_answer, split_qa, SPECIAL_TOKENS, THINKING_START, THINKING_END, ANSWER_START
+except ImportError:
+    # Fallback if running from different directory
+    sys.path.append(str(Path(__file__).parent.parent.parent / "scripts" / "utils"))
+    from gsm8k_utils import extract_answer, extract_thinking_and_answer, split_qa, SPECIAL_TOKENS, THINKING_START, THINKING_END, ANSWER_START
 
 # ============================================================================
 # Process Reward Model (PRM)

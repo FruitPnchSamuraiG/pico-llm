@@ -444,8 +444,11 @@ train_gsm8k() {
   
   # Improved hyperparameters for GSM8K fine-tuning from Orca
   # These values are optimized to prevent overfitting while ensuring the model learns GSM8K reasoning
-  EPOCHS=${EPOCHS_OVERRIDE:-${GSM8K_EPOCHS:-10}}  # More epochs for better learning
-  LR=${LR_OVERRIDE:-3e-4}  # Conservative LR to preserve Orca knowledge
+  # WARNING: GSM8K is small (7.5k examples) - model overfits badly after epoch 5-6!
+  # NOTE: Using block_size=512 (instead of 256) to accommodate full <thinking> blocks (~200-300 tokens)
+  #       This allows the model to learn complete reasoning chains without truncation
+  EPOCHS=${EPOCHS_OVERRIDE:-${GSM8K_EPOCHS:-5}}  # REDUCED from 10 to 5 to prevent overfitting
+  LR=${LR_OVERRIDE:-1e-4}  # LOWERED from 3e-4 to 1e-4 to preserve Orca knowledge
   LR_WARMUP_STEPS=${WARMUP_OVERRIDE:-500}  # Longer warmup for stability
   LR_MIN_RATIO=0.1  # Drop to 10% of peak LR by end
   
@@ -461,17 +464,19 @@ train_gsm8k() {
   echo "  Weight decay: $WEIGHT_DECAY"
   echo ""
   
-  print_header "🚀 Starting Supervised Fine-tuning on GSM8K"
+  print_header "🚀 Starting Supervised Fine-tuning on GSM8K (with <thinking> blocks)"
+  # NOTE: Using block_size=256 to match base checkpoint architecture
+  # Some long thinking chains may be truncated, but model will still learn the format
   python pico-llm.py \
     --enable_transformer --disable_lstm \
     --device_id "$DEVICE" \
     --checkpoint_dir "$ft_dir" \
     --init_from "$BASE_CKPT" \
     --tinystories_weight 0.0 \
-    --input_files "$DATA_DIR/gsm8k_train.txt" \
+    --input_files "$DATA_DIR/gsm8k_train_reasoning_structured.txt" \
     --batch_size "$BATCH" \
     --num_epochs "$EPOCHS" \
-    --block_size "$BLOCK_SIZE" \
+    --block_size 256 \
     --transformer_size "$TRANSFORMER_SIZE" \
     --learning_rate "$LR" \
     --val_split "$VAL_SPLIT" \
