@@ -591,6 +591,14 @@ class TransformerBlock(nn.Module):
             k = torch.cat([kv_cache['k'], k], dim=2)  # Concatenate along sequence dimension
             v = torch.cat([kv_cache['v'], v], dim=2)
         
+        # Trim KV cache to block_size to prevent buffer overflows
+        if causal_mask is not None:
+            block_size = causal_mask.size(-1)
+            if k.size(2) > block_size:
+                k = k[:, :, -block_size:, :]
+            if v.size(2) > block_size:
+                v = v[:, :, -block_size:, :]
+        
         # Prepare cache for next step if requested
         new_cache = None
         if use_cache:
@@ -758,6 +766,7 @@ class TransformerModel(nn.Module):
                 pos_start = 0
             
             pos = torch.arange(pos_start, pos_start + seq_len, device=tokens_seq.device).unsqueeze(0)  # (1, seq_len)
+            pos = pos % self.block_size # NEW: Ensure pos is within bounds for KV cache
             x = x + self.pos_emb(pos)  # Broadcast and add
         
         # Pass through all Transformer blocks with optional caching
@@ -919,9 +928,9 @@ def generate_text_with_thinking(
              model_vocab_size = model.embed.weight.shape[0]
              
         # Check for out-of-bounds tokens in prompt
-        if any(t >= model_vocab_size for t in context_tokens):
-            print(f"Warning: Prompt contains tokens >= model vocab size {model_vocab_size}. Clamping.")
-            context_tokens = [min(t, model_vocab_size - 1) for t in context_tokens]
+        if any(t >= model_vocab_size or t < 0 for t in context_tokens):
+            print(f"Warning: Prompt contains tokens outside model vocab size [0, {model_vocab_size-1}]. Clamping.")
+            context_tokens = [min(max(t, 0), model_vocab_size - 1) for t in context_tokens]
         
         # Determine initial phase based on prompt
         prompt_text = init_text.lower()
@@ -1022,6 +1031,8 @@ def generate_text_with_thinking(
             # Update KV Cache / Compute next logits for NEXT iteration
             if use_kv_cache:
                 inp = torch.tensor([[chosen_token]], dtype=torch.long, device=device).transpose(0, 1) # (1, 1)
+                # Clamp input token to valid range before passing to model
+                inp = torch.clamp(inp, 0, model_vocab_size - 1)
                 logits_seq, kv_cache = model(inp, kv_cache=kv_cache, use_cache=True)
                 next_logits = logits_seq[-1, 0, :]
             
@@ -1117,9 +1128,9 @@ def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p
              model_vocab_size = model.embed.weight.shape[0]
 
         # Check for out-of-bounds tokens in prompt
-        if any(t >= model_vocab_size for t in context_tokens):
-            print(f"Warning: Prompt contains tokens >= model vocab size {model_vocab_size}. Clamping.")
-            context_tokens = [min(t, model_vocab_size - 1) for t in context_tokens]
+        if any(t >= model_vocab_size or t < 0 for t in context_tokens):
+            print(f"Warning: Prompt contains tokens outside model vocab size [0, {model_vocab_size-1}]. Clamping.")
+            context_tokens = [min(max(t, 0), model_vocab_size - 1) for t in context_tokens]
         
         # Check if model supports KV-caching (Transformer only)
         use_kv_cache = isinstance(model, TransformerModel)
@@ -1178,6 +1189,8 @@ def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p
             # Prepare for next step (KV cache update)
             if use_kv_cache:
                 inp = torch.tensor([[chosen_token]], dtype=torch.long, device=device).transpose(0, 1) # (1, 1)
+                # Clamp input token to valid range before passing to model
+                inp = torch.clamp(inp, 0, model_vocab_size - 1)
                 logits, kv_cache = model(inp, kv_cache=kv_cache, use_cache=True)
                 next_logits = logits[-1, 0, :]
     
