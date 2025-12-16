@@ -58,6 +58,29 @@ python scripts/evaluation/generate_grpo_groups_multi_gpu.py --checkpoint path/to
 - Fast, memory-efficient batch generation
 - Designed for large-scale evaluation
 
+### 5. Mechanistic Interpretability Visualizations
+
+Analyze model internals with 7 publication-quality interpretability plots inspired by Anthropic's mechanistic interpretability work:
+
+```bash
+python plot_interpretability.py --checkpoint path/to/model.pt --prompt "Q: What is 2 + 2? A:" --device cuda:0 --output_dir interpretability_plots
+```
+
+**Generated plots:**
+1. **Attention Head Patterns** - Visualize attention weights across all heads and layers (how tokens attend to each other)
+2. **Logit Lens** - Layer-by-layer prediction evolution showing when the model "makes up its mind" 
+3. **Token Embeddings** - 2D PCA projection of embedding space structure (semantic/syntactic clustering)
+4. **Activation Distribution** - Mean activations and histograms per layer (detect scaling issues)
+5. **Feature Co-activation** - Correlation heatmap of which features fire together + sparsity patterns
+6. **Feature Importance** - Attribution-based ranking of most important features by layer
+7. **Feature Geometry** - t-SNE projection + PCA variance of embedding space dimensionality
+
+Use these plots to:
+- Debug model behavior and understand learned representations
+- Identify bottleneck layers or dead neurons
+- Analyze feature interactions and compositionality
+- Assess embedding space structure and dimensionality
+
 ## Key Features
 
 - **Auto-architecture and vocab detection**: Inference and evaluation scripts automatically detect model size, block count, and vocabulary from checkpoints.

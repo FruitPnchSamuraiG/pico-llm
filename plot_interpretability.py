@@ -28,8 +28,15 @@ import seaborn as sns
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
 
-from pico_llm import TransformerModel, RMSNorm
+from importlib.util import spec_from_file_location, module_from_spec
+spec = spec_from_file_location("pico_llm", Path(__file__).parent / "pico-llm.py")
+pico_llm = module_from_spec(spec)
+spec.loader.exec_module(pico_llm)
+TransformerModel = pico_llm.TransformerModel
+RMSNorm = pico_llm.RMSNorm
 
 sns.set_style("whitegrid")
 plt.rcParams['figure.dpi'] = 150
