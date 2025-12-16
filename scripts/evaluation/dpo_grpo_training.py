@@ -209,20 +209,6 @@ def compute_logprob(
     return lp
 
 
-def approx_kl_per_token(
-    policy_logp: torch.Tensor,
-    ref_logp: torch.Tensor,
-    cont_len: torch.Tensor,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Approximate KL(π || π_ref) per token using log-prob difference.
-
-    Common practical proxy: E[logπ - logπ_ref].
-    Here we normalize by continuation length for stability.
-    """
-    return (policy_logp - ref_logp) / (cont_len + eps)
-
-
 # ============================================================================
 # Pre-generated Preference Loading
 # ============================================================================
@@ -579,92 +565,92 @@ def train_dpo(
                     sum(batch_rejected_rewards) / max(1, len(batch_rejected_rewards))
                 )
         
-        else:
-            # Original on-the-fly generation (SLOW)
-            batch_lines = random.sample(train_lines, k=min(args.batch_size, len(train_lines)))
+        # else:
+        #     # Original on-the-fly generation (SLOW)
+        #     batch_lines = random.sample(train_lines, k=min(args.batch_size, len(train_lines)))
             
-            batch_losses = []
-            batch_accs = []
-            batch_chosen_rewards = []
-            batch_rejected_rewards = []
+        #     batch_losses = []
+        #     batch_accs = []
+        #     batch_chosen_rewards = []
+        #     batch_rejected_rewards = []
             
-            optimizer.zero_grad(set_to_none=True)
+        #     optimizer.zero_grad(set_to_none=True)
             
-            for line in batch_lines:
-                prompt, gold = split_qa(line)
-                if not gold:
-                    continue
+        #     for line in batch_lines:
+        #         prompt, gold = split_qa(line)
+        #         if not gold:
+        #             continue
                 
-                prompt_tokens = enc.encode(prompt)
-                max_prompt = max(1, args.block_size - args.max_new_tokens)
-                if len(prompt_tokens) > max_prompt:
-                    prompt_tokens = prompt_tokens[-max_prompt:]
-                    prompt = enc.decode(prompt_tokens)
+        #         prompt_tokens = enc.encode(prompt)
+        #         max_prompt = max(1, args.block_size - args.max_new_tokens)
+        #         if len(prompt_tokens) > max_prompt:
+        #             prompt_tokens = prompt_tokens[-max_prompt:]
+        #             prompt = enc.decode(prompt_tokens)
                 
-                # Sample TWO completions for (synthetic) preference pair.
-                completions = []
-                for _ in range(2):
-                    text, _ = inf.generate_text(
-                        model,
-                        enc,
-                        prompt,
-                        max_new_tokens=args.max_new_tokens,
-                        device=str(device),
-                        top_p=args.top_p,
-                    )
-                    full_tokens = enc.encode(text)[: args.block_size]
-                    pred = extract_answer(text)
-                    reward = args.reward_correct if (pred == gold) else args.reward_incorrect
-                    completions.append((full_tokens, reward))
+        #         # Sample TWO completions for (synthetic) preference pair.
+        #         completions = []
+        #         for _ in range(2):
+        #             text, _ = inf.generate_text(
+        #                 model,
+        #                 enc,
+        #                 prompt,
+        #                 max_new_tokens=args.max_new_tokens,
+        #                 device=str(device),
+        #                 top_p=args.top_p,
+        #             )
+        #             full_tokens = enc.encode(text)[: args.block_size]
+        #             pred = extract_answer(text)
+        #             reward = args.reward_correct if (pred == gold) else args.reward_incorrect
+        #             completions.append((full_tokens, reward))
                 
-                completions.sort(key=lambda x: x[1], reverse=True)
-                chosen_tokens, chosen_reward = completions[0]
-                rejected_tokens, rejected_reward = completions[1]
+        #         completions.sort(key=lambda x: x[1], reverse=True)
+        #         chosen_tokens, chosen_reward = completions[0]
+        #         rejected_tokens, rejected_reward = completions[1]
                 
-                if chosen_reward == rejected_reward:
-                    continue
+        #         if chosen_reward == rejected_reward:
+        #             continue
                 
-                # Compute seq log-probs and continuation lengths (vectorized).
-                policy_chosen_logp, chosen_len = compute_logprob_and_len(model, chosen_tokens, len(prompt_tokens), device)
-                policy_rejected_logp, rejected_len = compute_logprob_and_len(model, rejected_tokens, len(prompt_tokens), device)
+        #         # Compute seq log-probs and continuation lengths (vectorized).
+        #         policy_chosen_logp, chosen_len = compute_logprob_and_len(model, chosen_tokens, len(prompt_tokens), device)
+        #         policy_rejected_logp, rejected_len = compute_logprob_and_len(model, rejected_tokens, len(prompt_tokens), device)
                 
-                with torch.no_grad():
-                    ref_chosen_logp, _ = compute_logprob_and_len(reference_model, chosen_tokens, len(prompt_tokens), device)
-                    ref_rejected_logp, _ = compute_logprob_and_len(reference_model, rejected_tokens, len(prompt_tokens), device)
+        #         with torch.no_grad():
+        #             ref_chosen_logp, _ = compute_logprob_and_len(reference_model, chosen_tokens, len(prompt_tokens), device)
+        #             ref_rejected_logp, _ = compute_logprob_and_len(reference_model, rejected_tokens, len(prompt_tokens), device)
                 
-                loss, chosen_rew, rejected_rew = dpo_loss(
-                    policy_chosen_logp,
-                    policy_rejected_logp,
-                    ref_chosen_logp,
-                    ref_rejected_logp,
-                    beta=args.beta,
-                )
+        #         loss, chosen_rew, rejected_rew = dpo_loss(
+        #             policy_chosen_logp,
+        #             policy_rejected_logp,
+        #             ref_chosen_logp,
+        #             ref_rejected_logp,
+        #             beta=args.beta,
+        #         )
                 
-                batch_losses.append(loss)
-                batch_accs.append(1.0)
-                batch_chosen_rewards.append(chosen_rew.item())
-                batch_rejected_rewards.append(rejected_rew.item())
+        #         batch_losses.append(loss)
+        #         batch_accs.append(1.0)
+        #         batch_chosen_rewards.append(chosen_rew.item())
+        #         batch_rejected_rewards.append(rejected_rew.item())
             
-            if not batch_losses:
-                continue
+        #     if not batch_losses:
+        #         continue
             
-            total_loss = torch.stack(batch_losses).mean()
-            total_loss.backward()
+        #     total_loss = torch.stack(batch_losses).mean()
+        #     total_loss.backward()
             
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        #     if args.grad_clip > 0:
+        #         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             
-            optimizer.step()
-            scheduler.step()
+        #     optimizer.step()
+        #     scheduler.step()
             
-            running_loss = 0.9 * running_loss + 0.1 * total_loss.item()
-            running_acc = 0.9 * running_acc + 0.1 * (sum(batch_accs) / max(1, len(batch_accs)))
-            running_chosen_reward = 0.9 * running_chosen_reward + 0.1 * (
-                sum(batch_chosen_rewards) / max(1, len(batch_chosen_rewards))
-            )
-            running_rejected_reward = 0.9 * running_rejected_reward + 0.1 * (
-                sum(batch_rejected_rewards) / max(1, len(batch_rejected_rewards))
-            )
+        #     running_loss = 0.9 * running_loss + 0.1 * total_loss.item()
+        #     running_acc = 0.9 * running_acc + 0.1 * (sum(batch_accs) / max(1, len(batch_accs)))
+        #     running_chosen_reward = 0.9 * running_chosen_reward + 0.1 * (
+        #         sum(batch_chosen_rewards) / max(1, len(batch_chosen_rewards))
+        #     )
+        #     running_rejected_reward = 0.9 * running_rejected_reward + 0.1 * (
+        #         sum(batch_rejected_rewards) / max(1, len(batch_rejected_rewards))
+        #     )
         
         if step % args.log_every == 0:
             lr = optimizer.param_groups[0]["lr"]
