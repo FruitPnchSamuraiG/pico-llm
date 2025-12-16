@@ -1147,7 +1147,8 @@ def generate_text_with_thinking(
     return final_text, phase_info
 
 
-def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p=None, temperature=1.0):
+def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p=None, temperature=1.0,
+                  monosemantic_info=None, do_monosemantic=False):
     """
     Generate text from a prompt using the trained model.
     
@@ -1155,6 +1156,7 @@ def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p
     - KV-caching for Transformer models (faster generation)
     - Nucleus (top-p) sampling
     - Temperature scaling
+    - Monosemantic analysis (nearest neighbor annotations)
     
     PARAMETERS:
     - model: Trained model (Transformer, LSTM, or K-gram)
@@ -1164,10 +1166,12 @@ def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p
     - device: "cpu" or "cuda:0"
     - top_p: Nucleus sampling threshold (None for greedy)
     - temperature: Sampling temperature (1.0 = no change)
+    - monosemantic_info: Optional dict with "embeddings" key for monosemantic analysis
+    - do_monosemantic: Whether to perform monosemantic analysis
     
     RETURNS:
     - generated_text: Full text (prompt + generated)
-    - tokens: List of token IDs
+    - annotated_text: Text with monosemantic annotations (if enabled)
     """
     was_training = model.training
     model.eval()
@@ -1202,6 +1206,10 @@ def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p
             # Will be processed in loop
             pass
             
+        # Track annotations for monosemantic analysis
+        annotation_list = []
+        initial_prompt_len = len(context_tokens)
+        
         for _ in range(max_new_tokens):
             # Prepare input for this step
             if use_kv_cache and kv_cache is not None:
@@ -1239,6 +1247,15 @@ def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p
             chosen_token = max(0, min(chosen_token, vocab_size - 1))
             context_tokens.append(chosen_token)
             
+            # Optional: Monosemantic analysis
+            if do_monosemantic and monosemantic_info is not None:
+                neighbors = monosemantic_analysis_for_token(
+                    chosen_token, model, monosemantic_info, enc, device=device, top_n=5
+                )
+                annotation_list.append((chosen_token, neighbors))
+            else:
+                annotation_list.append((chosen_token, []))
+            
             # Prepare for next step (KV cache update)
             if use_kv_cache:
                 inp = torch.tensor([[chosen_token]], dtype=torch.long, device=device).transpose(0, 1) # (1, 1)
@@ -1249,7 +1266,21 @@ def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p
     
     model.train(was_training)
     generated_text = enc.decode(context_tokens)
-    return generated_text, context_tokens
+    
+    # Build annotated text with monosemantic annotations
+    prefix_text = enc.decode(context_tokens[:initial_prompt_len])
+    annotated_strs = [prefix_text]
+    for (tid, neighs) in annotation_list:
+        token_str = enc.decode([tid])
+        if neighs:
+            neighbor_strs = [f"{enc.decode([x[1]])}" for x in neighs]
+            annotated = f"{token_str}[NN={neighbor_strs}]"
+        else:
+            annotated = token_str
+        annotated_strs.append(annotated)
+    
+    annotated_text = "".join(annotated_strs)
+    return generated_text, annotated_text
 
 
 ################################################################################
@@ -1455,7 +1486,9 @@ def train_one_model(model,
                     print(f"\n[{model_name}] Generating sample text (greedy) at epoch={epoch}, step={batch_idx}...")
                     text_greedy, ann_greedy = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=str(device),
-                        top_p=None  # None = greedy
+                        top_p=None,  # None = greedy
+                        monosemantic_info=monosemantic_info,
+                        do_monosemantic=(monosemantic_info is not None)
                     )
                     print(f" Greedy Sample: {text_greedy}")
                     print(f" Annotated: {ann_greedy}\n")
@@ -1464,7 +1497,9 @@ def train_one_model(model,
                     print(f"[{model_name}] Generating sample text (top-p=0.95) at epoch={epoch}, step={batch_idx}...")
                     text_topp, ann_topp = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=str(device),
-                        top_p=0.95  # Keep top 95% probability mass
+                        top_p=0.95,  # Keep top 95% probability mass
+                        monosemantic_info=monosemantic_info,
+                        do_monosemantic=(monosemantic_info is not None)
                     )
                     print(f" Top-p (p=0.95) Sample: {text_topp}")
                     print(f" Annotated: {ann_topp}\n")
@@ -1473,7 +1508,9 @@ def train_one_model(model,
                     print(f"[{model_name}] Generating sample text (top-p=1.0) at epoch={epoch}, step={batch_idx}...")
                     text_topp1, ann_topp1 = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=str(device),
-                        top_p=1.0  # Sample from entire distribution
+                        top_p=1.0,  # Sample from entire distribution
+                        monosemantic_info=monosemantic_info,
+                        do_monosemantic=(monosemantic_info is not None)
                     )
                     print(f" Top-p (p=1.0) Sample: {text_topp1}")
                     print(f" Annotated: {ann_topp1}\n")
@@ -1801,6 +1838,7 @@ def main():
             lr_schedule=args.lr_schedule,
             lr_warmup_steps=args.lr_warmup_steps,
             lr_min_ratio=args.lr_min_ratio,
+            monosemantic_info=monosemantic_info,
         )
         
         # Store loss histories (both train and val)
