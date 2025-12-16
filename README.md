@@ -1,114 +1,110 @@
-# pico-llm
-CSCI-GA.2565 — Pico-LLM
+# Pico-LLM: Unified Inference & Training
 
-## Overview
-This repository contains implementations of three language modeling approaches:
-1. **K-gram MLP**: Fixed-window feedforward model with optimized vectorized operations
-2. **LSTM**: Recurrent neural network with long short-term memory
-3. **Transformer**: Attention-based decoder-only model (GPT-style)
+Pico-LLM is a lightweight, research-friendly codebase for training and evaluating small language models (LLMs) on reasoning and instruction-following tasks. It supports:
 
-### Key Features
-- **Optimized K-gram MLP**: Uses `unfold()` for vectorized sliding window processing (much faster than nested loops)
-- **Helper Scripts**:
-  - `inference.py`: Run inference on trained models
-  - `plot_losses.py`: Plot training curves
-  - `train_all_models.sh`: Convenient training script for all models
-- **Well-documented code**: Comprehensive comments explaining architecture and algorithms
+- **Supervised Fine-Tuning (SFT)** for instruction-following and reasoning datasets
+- **DPO/GRPO** (Direct Preference Optimization / Generalized Rank Preference Optimization) for preference-based RLHF-style training
+- **Unified Inference** with auto-architecture detection, KV-caching, and robust sampling
+- **Flexible model architectures**: Transformer, LSTM, and K-gram MLP
+- **Efficient batch generation and evaluation scripts**
+- **Robust token handling**: Prevents CUDA errors from vocab mismatches (auto-detects vocab size from checkpoint)
 
 ## Quick Start
 
-### Training with Multiple Configurations
-The `train_all_models.sh` script runs 4 different hyperparameter configurations automatically:
+### 1. Inference
+
+Run inference on a trained checkpoint (auto-detects architecture and vocab size):
 
 ```bash
-# Quick CPU test - runs all 4 configurations
-bash train_all_models.sh
-
-# GPU training - runs all 4 configurations on GPU
-bash train_all_models.sh --gpu
+python inference.py --checkpoint path/to/model.pt --prompt "Q: 2+2=? A: <thinking>"
 ```
 
-**Configurations:**
-1. **baseline**: Small model (k=3, embed=256) - fastest, good for testing
-2. **large_embed**: Larger embeddings (k=3, embed=512) - better capacity
-3. **wide_context**: Wider context window (k=5, embed=384) - longer history
-4. **deep_model**: Deeper architecture (k=4, 4 blocks, embed=384) - more layers
+- Use `--thinking` for reasoning models (multi-phase generation)
+- Supports batch prompts via `--input_file`
+- Handles all model sizes and vocabularies automatically
+- Automatically clamps prompt tokens to model vocab size to avoid CUDA errors
 
-Each configuration generates:
-- `training_losses_[config].png` - Loss comparison plot
-- `loss_histories_[config].pkl` - Raw loss data
-- `*_epoch*_[config].pt` - Model checkpoints
+### 2. Supervised Fine-Tuning (SFT)
 
-### Custom Training
-```bash
-python pico-llm.py --enable_kgram --enable_transformer \
-    --batch_size 16 --num_epochs 3 --device_id cuda:0
-```
-
-### Inference
-```bash
-python inference.py --model transformer \
-    --checkpoint transformer_epoch3_baseline.pt \
-    --prompt "Once upon a time" \
-    --max_tokens 100
-```
-
-### Plot Results
-```bash
-# Plot a specific configuration
-python plot_losses.py --input loss_histories_baseline.pkl
-
-# With smoothing and log scale
-python plot_losses.py --input loss_histories_deep_model.pkl --smooth 20 --log
-```
-
-## Normalization
-1. Toggle Pre/Post-Normalization by setting --norm_type=pre (default) or --norm_type=post
-2. Enable SGD with no warmup by setting --warmup=no
-3. Enable SGD with warmup by setting --warmup=yes
-
-## Interpretability & Analysis
-
-### Attention Head Visualization
-
-Visualize what Transformer attention heads are learning by saving heatmaps for any prompt:
+Train a model on reasoning or instruction-following data:
 
 ```bash
-# Save attention maps with positional embeddings
-python3 pico-llm.py \
-  --enable_transformer --disable_lstm \
-  --device_id cpu \
-  --tinystories_weight 0.0 --input_files 3seqs.txt \
-  --block_size 128 --batch_size 4 --num_epochs 1 --max_steps_per_epoch 2 \
-  --save_attention_for_prompt --attention_outdir attn_plots_pos \
-  --prompt "Once upon a time"
-
-# Compare without positional embeddings
-python3 pico-llm.py \
-  --enable_transformer --disable_lstm \
-  --device_id cpu \
-  --tinystories_weight 0.0 --input_files 3seqs.txt \
-  --block_size 128 --batch_size 4 --num_epochs 1 --max_steps_per_epoch 2 \
-  --no_pos_emb --save_attention_for_prompt --attention_outdir attn_plots_nopos \
-  --prompt "Once upon a time"
+python pico-llm.py --enable_transformer --input_files data/gsm8k_train.txt --num_epochs 3 --checkpoint_dir checkpoints/
 ```
 
-**Output**: PNG heatmaps named `attn_block{B}_head{H}_pos{0|1}.png`
-- **Y-axis**: Query positions (tokens asking for info)
-- **X-axis**: Key positions (tokens being attended to)
-- **Brightness**: Attention probability (brighter = more attention)
+- Supports TinyStories and custom datasets
+- Model size and architecture are configurable via flags (see below)
+- Checkpoints and loss histories are saved for each run
 
-**What to Look For:**
-- **Diagonal patterns**: Local attention (syntax-focused heads)
-- **Vertical stripes**: Attention to specific positions (punctuation, first token)
-- **Lower triangular**: Causal constraint (can't attend to future)
-- **Head specialization**: Different heads learning different patterns
+### 3. DPO/GRPO Training (Preference Optimization)
 
+For preference-based RLHF-style training:
 
-## Requirements
-- Python 3.8+
-- PyTorch
-- tiktoken
-- datasets
-- matplotlib
+```bash
+python scripts/evaluation/dpo_grpo_training.py --checkpoint_dir checkpoints/ --input_file data/gsm8k_train_prompts_only.txt
+```
+
+- Uses SFT-trained checkpoints as initialization
+- Supports multi-GPU and efficient batch generation
+
+### 4. Batch Generation & Evaluation
+
+Generate outputs for a set of prompts (with KV-caching):
+
+```bash
+python scripts/evaluation/generate_grpo_groups_multi_gpu.py --checkpoint path/to/model.pt --input_file data/gsm8k_test.txt --output_file results.jsonl
+```
+
+- Fast, memory-efficient batch generation
+- Designed for large-scale evaluation
+
+## Key Features
+
+- **Auto-architecture and vocab detection**: Inference and evaluation scripts automatically detect model size, block count, and vocabulary from checkpoints.
+- **Robust token handling**: Prevents CUDA errors from vocab mismatches (prompt tokens are clamped to model vocab size).
+- **KV-caching**: Fast Transformer generation for both single and batch inference.
+- **Unified codebase**: All training and inference logic in `pico-llm.py` and `inference.py`.
+- **Flexible data loading**: Supports HuggingFace TinyStories, GSM8K, OrcaMath, and custom text files.
+
+## Model Architectures
+
+- **Transformer** (default): GPT-2 style, configurable size
+- **LSTM**: Baseline sequence model
+- **K-gram MLP**: Fixed-window feedforward baseline
+
+## Example Training Commands
+
+**Train a small Transformer on TinyStories:**
+```bash
+python pico-llm.py --enable_transformer --transformer_size small --num_epochs 2
+```
+
+**Train on custom data:**
+```bash
+python pico-llm.py --enable_transformer --input_files data/gsm8k_train.txt --num_epochs 3
+```
+
+**Resume or finetune from checkpoint:**
+```bash
+python pico-llm.py --enable_transformer --init_from checkpoints/transformer_epoch2.pt
+```
+
+## Advanced: DPO/GRPO Training
+
+- See `scripts/evaluation/dpo_grpo_training.py` for preference-based optimization.
+- Use `generate_grpo_groups_multi_gpu.py` for efficient batch generation and evaluation.
+
+## File Overview
+
+- `pico-llm.py`: All model definitions, training, and generation logic
+- `inference.py`: Unified inference script (auto-detects model, robust to vocab mismatches)
+- `scripts/evaluation/`: DPO/GRPO training and batch generation scripts
+- `data/`: Example datasets (GSM8K, TinyStories, OrcaMath)
+
+## Tips
+
+- For reasoning models, always use prompts with `<thinking>` and `--thinking` flag for best results.
+- All scripts are robust to model size and vocabulary mismatches.
+- Checkpoints are saved after every epoch for easy resumption.
+- Batch generation scripts use KV-caching for speed and memory efficiency.
 

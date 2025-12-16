@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Logs / outputs
+*.log
+
+# Model checkpoints / artifacts
+*.pt
+*.pth
+*.ckpt
+loss_histories*.pkl
+training_losses*.png
+attn_plots*/
+
+# Local data
+data/
+
+# Local artifacts / reports (should not be committed)
+*.pkl
+*.pdf
+training_stats.txt
+loss_histories*.pkl
+__pycache__/
+*.pyc
+
+# Scratch outputs (keep path out of repo)
+/scratch/
+
+# Editors
+.vscode/
+.idea/

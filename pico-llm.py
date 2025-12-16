@@ -2,6 +2,8 @@ import argparse
 import time
 import random 
 import math
+import os
+import pickle
 import torch
 import torch.nn as nn
 import torch.optim as optim 
@@ -21,6 +23,15 @@ def parse_args():
                         help="Optional list of text files to mix in as data sources. Each line is one example (up to block_size).")
     parser.add_argument("--tinystories_weight", type=float, default=0.5,
                         help="Probability of sampling from TinyStories if present. Default=0.5. (set to 0.0 to skip TinyStories).")
+
+    # NEW: TinyStories subset size control
+    parser.add_argument(
+        "--tinystories_train_subset_size",
+        type=int,
+        default=20000,
+        help="How many TinyStories train examples to load (default: 20000). Increase for larger training.",
+    )
+
     parser.add_argument("--max_steps_per_epoch", type=int, default=None,
                         help="If set, each epoch ends after this many steps (for quick tests).")
     parser.add_argument("--num_inner_mlp_layers", type=int, default=1,
@@ -71,14 +82,117 @@ def parse_args():
     parser.add_argument("--warmup", type=str, default='', 
                         help="Set to 'yes' or 'no'. If set to either, SGD will be enabled instead of Adam")
     
+    # NEW: convenience preset for larger transformer training
+    parser.add_argument(
+        "--transformer_size",
+        type=str,
+        default="small",
+        choices=["small", "medium", "gpt2-small", "gpt2-medium", "gpt2-large", "gpt2-xl"],
+        help=(
+            "Convenience preset that sets embed_size/heads/blocks/ff_mult. "
+            "Overrides individual flags if provided. "
+            "small=384/4/3/2 (~10M, ~2GB), medium=512/8/6/4 (~40M, ~4GB), "
+            "gpt2-small=768/12/12/4 (117M, ~8GB), gpt2-medium=1024/16/24/4 (345M, ~16GB), "
+            "gpt2-large=1280/20/36/4 (774M, ~32GB), gpt2-xl=1600/25/48/4 (1.5B, ~64GB). "
+            "For GTX TITAN X (12GB): Use small, medium, or gpt2-small (with reduced batch)."
+        ),
+    )
+
     # Training stability and quality improvements
-    # parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm. Prevents exploding gradients.")
-    # parser.add_argument("--weight_decay", type=float, default=0.01, help="L2 regularization weight decay for AdamW.")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm. Prevents exploding gradients.")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="L2 regularization weight decay for AdamW.")
     
     # Validation split
     parser.add_argument("--val_split", type=float, default=0.1, help="Fraction of data to use for validation (0.1 = 10 percent)")
 
+    # Checkpoint / artifact output directory
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="/scratch/kk6081/picollm_extend",
+        help="Directory to write checkpoints and loss histories (default: /scratch/kk6081/picollm_extend).",
+    )
+
+    parser.add_argument(
+        "--init_from",
+        type=str,
+        default="",
+        help="Optional path to a .pt state_dict to initialize the Transformer from (for finetuning).",
+    )
+
+    # Training / speed knobs
+    parser.add_argument(
+        "--sample_interval_seconds",
+        type=int,
+        default=120,
+        help="Generate sample text every N seconds during training (default: 120). Increase for faster training.",
+    )
+    parser.add_argument(
+        "--sample_every_steps",
+        type=int,
+        default=0,
+        help="If >0, generate sample text every N training steps (overrides --sample_interval_seconds).",
+    )
+
+    # Dynamic LR scheduling
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="cosine",
+        choices=["none", "cosine", "linear"],
+        help="Learning-rate schedule for faster training: none|cosine|linear (default: cosine).",
+    )
+    parser.add_argument(
+        "--lr_warmup_steps",
+        type=int,
+        default=200,
+        help="Warmup steps for LR schedule (default: 200).",
+    )
+    parser.add_argument(
+        "--lr_min_ratio",
+        type=float,
+        default=0.1,
+        help="Min LR as a fraction of base LR for cosine/linear decay (default: 0.1).",
+    )
+
     args = parser.parse_args()
+
+    # Apply transformer size preset (only affects transformer hyperparams)
+    if args.transformer_size == "small":
+        args.embed_size = 384
+        args.transformer_heads = 4
+        args.transformer_blocks = 3
+        args.ff_mult = 2
+    elif args.transformer_size == "medium":
+        args.embed_size = 512
+        args.transformer_heads = 8
+        args.transformer_blocks = 6
+        args.ff_mult = 4
+    elif args.transformer_size == "gpt2-small":
+        # GPT-2 Small: 117M parameters
+        args.embed_size = 768
+        args.transformer_heads = 12
+        args.transformer_blocks = 12
+        args.ff_mult = 4
+    elif args.transformer_size == "gpt2-medium":
+        # GPT-2 Medium: 345M parameters
+        args.embed_size = 1024
+        args.transformer_heads = 16
+        args.transformer_blocks = 24
+        args.ff_mult = 4
+    elif args.transformer_size == "gpt2-large":
+        # GPT-2 Large: 774M parameters
+        args.embed_size = 1280
+        args.transformer_heads = 20
+        args.transformer_blocks = 36
+        args.ff_mult = 4
+    elif args.transformer_size == "gpt2-xl":
+        # GPT-2 XL: 1.5B parameters
+        args.embed_size = 1600
+        args.transformer_heads = 25
+        args.transformer_blocks = 48
+        args.ff_mult = 4
+
     return args
 
 
@@ -154,7 +268,6 @@ def seq_collate_fn(batch):
 
 ################################################################################
 # 4. K-gram MLP: Fixed-window feedforward baseline
-#    Simplest sequence model: predict next token from last k tokens
 ################################################################################
 
 def compute_next_token_loss(logits, tokens):
@@ -228,6 +341,16 @@ class KGramMLPSeqModel(nn.Module):
         # Set the current network as a sequential model of the above layers
         self.net = nn.Sequential(*layers)
 
+
+    def _init_weights(self, module):
+        """Initialize weights following GPT-2 conventions for training stability."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, tokens_seq):
         """
         Process sequence autoregressively: predict each position from its k-token history.
@@ -298,6 +421,16 @@ class LSTMSeqModel(nn.Module):
         # batch_first=False means input shape is (seq_len, batch, embed_size)
         self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=False)
         self.linear = nn.Linear(hidden_size, vocab_size)
+
+
+    def _init_weights(self, module):
+        """Initialize weights following GPT-2 conventions for training stability."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, tokens_seq):
         """
@@ -371,6 +504,11 @@ class TransformerBlock(nn.Module):
     - Residual connections: Enable gradient flow through deep networks
     - RMSNorm: Stabilize activations
     
+    KV-CACHING:
+    - During generation, cache K, V tensors to avoid recomputing them
+    - Only compute K, V for new tokens and concatenate with cache
+    - Dramatically speeds up autoregressive generation (O(n) -> O(1) per token)
+    
     PARAMETERS:
     - d_model: Model dimension (embed_size)
     - n_heads: Number of attention heads (must divide d_model evenly)
@@ -405,20 +543,28 @@ class TransformerBlock(nn.Module):
         self.save_attention = False
         self.last_attn_probs = None
 
-    def forward(self, x, causal_mask=None):
+    def forward(self, x, causal_mask=None, kv_cache=None, use_cache=False):
         """
         Process sequence through attention and feedforward with residuals.
         
-        INPUT: x (batch, seq_len, d_model), causal_mask (1, max_len, max_len)
-        OUTPUT: (batch, seq_len, d_model)
+        INPUT: 
+            x (batch, seq_len, d_model) - Input sequence
+            causal_mask (1, max_len, max_len) - Causal attention mask
+            kv_cache (dict) - Optional cache containing 'k' and 'v' tensors from previous steps
+            use_cache (bool) - Whether to return updated cache for next step
         
-        MULTI-HEAD ATTENTION ALGORITHM:
+        OUTPUT: 
+            x (batch, seq_len, d_model) - Output sequence
+            new_cache (dict or None) - Updated cache if use_cache=True
+        
+        MULTI-HEAD ATTENTION ALGORITHM (with KV-caching):
         1. Normalize input
         2. Project to Q, K, V and split into n_heads
-        3. Compute scaled dot-product attention per head
-        4. Apply causal mask (prevent attending to future tokens)
-        5. Concatenate heads and project
-        6. Add residual connection
+        3. If cache exists, concatenate cached K, V with new ones
+        4. Compute scaled dot-product attention per head
+        5. Apply causal mask (prevent attending to future tokens)
+        6. Concatenate heads and project
+        7. Add residual connection
         
         FEEDFORWARD:
         1. Normalize attention output
@@ -427,7 +573,7 @@ class TransformerBlock(nn.Module):
         """
         b, t, d = x.shape
         
-        # ===== ATTENTION BLOCK =====
+        # ===== ATTENTION BLOCK (with KV-caching) =====
         if self.norm_type == 'pre':
             xa = self.norm_attn(x)  # Pre-norm: normalize BEFORE attention
         else:
@@ -439,22 +585,45 @@ class TransformerBlock(nn.Module):
         k = self.k_proj(xa).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(xa).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         
+        # KV-cache: If cache exists, concatenate with new K, V
+        if kv_cache is not None:
+            # Cache format: {'k': (batch, n_heads, cache_len, head_dim), 'v': ...}
+            k = torch.cat([kv_cache['k'], k], dim=2)  # Concatenate along sequence dimension
+            v = torch.cat([kv_cache['v'], v], dim=2)
+        
+        # Trim KV cache to block_size to prevent buffer overflows
+        if causal_mask is not None:
+            block_size = causal_mask.size(-1)
+            if k.size(2) > block_size:
+                k = k[:, :, -block_size:, :]
+            if v.size(2) > block_size:
+                v = v[:, :, -block_size:, :]
+        
+        # Prepare cache for next step if requested
+        new_cache = None
+        if use_cache:
+            new_cache = {'k': k, 'v': v}
+        
+        # Current sequence length after concatenating with cache
+        kv_len = k.size(2)
+        
         # Scaled dot-product attention: Q @ K^T / sqrt(d_k)
-        # Shape: (batch, n_heads, seq_len, seq_len)
+        # Shape: (batch, n_heads, query_len, kv_len)
         attn_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         
         # Apply causal mask: prevent position i from attending to position j > i
         if causal_mask is not None:
-            # Slice mask to current sequence length (mask is pre-allocated for max_len)
-            attn_scores = attn_scores.masked_fill(causal_mask[:, None, :t, :t] == 0, -1e9)
+            # Slice mask to current sequence length
+            # For cached scenario: query_len=1 (new token), kv_len=cache_len+1
+            attn_scores = attn_scores.masked_fill(causal_mask[:, None, -t:, :kv_len] == 0, -1e9)
         
         # Softmax to get attention probabilities
-        attn_probs = F.softmax(attn_scores, dim=-1)  # (batch, heads, seq_len, seq_len)
+        attn_probs = F.softmax(attn_scores, dim=-1)  # (batch, heads, query_len, kv_len)
         if self.save_attention:
             self.last_attn_probs = attn_probs.detach().cpu()
         
         # Apply attention to values
-        attn_out = attn_probs @ v  # (batch, heads, seq_len, head_dim)
+        attn_out = attn_probs @ v  # (batch, heads, query_len, head_dim)
         
         # Concatenate heads and project
         attn_out = attn_out.transpose(1, 2).contiguous().view(b, t, d)
@@ -474,6 +643,8 @@ class TransformerBlock(nn.Module):
         if self.norm_type=='post':
             x = self.norm_ff(x)
         
+        if use_cache:
+            return x, new_cache
         return x
 
 
@@ -528,21 +699,52 @@ class TransformerModel(nn.Module):
         # Shape: (1, block_size, block_size), 1 = allowed, 0 = masked
         causal = torch.tril(torch.ones(block_size, block_size, dtype=torch.uint8))
         self.register_buffer("causal_mask", causal.unsqueeze(0))  # Save as non-trainable buffer
-
-    def forward(self, tokens_seq):
-        """
-        Forward pass for causal language modeling.
         
-        INPUT: tokens_seq (seq_len, batch_size) - Note: time-first format from DataLoader
-        OUTPUT: (seq_len, batch_size, vocab_size) - Logits for next token at each position
+        # Initialize weights properly (GPT-2 style)
+        self.apply(self._init_weights)
+        
+        # Scale residual connection weights for stability in deep networks
+        for block in self.blocks:
+            torch.nn.init.normal_(block.out_proj.weight, mean=0.0, std=0.02/math.sqrt(2 * n_blocks))
+            for layer in block.ff:
+                if isinstance(layer, nn.Linear):
+                    torch.nn.init.normal_(layer.weight, mean=0.0, std=0.02/math.sqrt(2 * n_blocks))
+
+
+    def _init_weights(self, module):
+        """Initialize weights following GPT-2 conventions for training stability."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, tokens_seq, kv_cache=None, use_cache=False):
+        """
+        Forward pass for causal language modeling with optional KV-caching.
+        
+        INPUT: 
+            tokens_seq (seq_len, batch_size) - Note: time-first format from DataLoader
+            kv_cache (list of dicts or None) - Cache for each layer, format: [{'k': tensor, 'v': tensor}, ...]
+            use_cache (bool) - Whether to return updated cache for next generation step
+        
+        OUTPUT: 
+            logits (seq_len, batch_size, vocab_size) - Logits for next token at each position
+            new_cache (list of dicts or None) - Updated cache if use_cache=True
         
         STEPS:
         1. Transpose to (batch, seq_len) for easier processing
         2. Embed tokens and add positional embeddings
-        3. Pass through all Transformer blocks (with causal masking)
+        3. Pass through all Transformer blocks (with causal masking and optional caching)
         4. Final normalization
         5. Project to vocabulary logits
         6. Transpose back to (seq_len, batch, vocab_size) for consistency
+        
+        KV-CACHING BEHAVIOR:
+        - If kv_cache is None: Normal forward pass, compute everything
+        - If kv_cache exists: Use cached K, V from previous steps, only compute for new tokens
+        - If use_cache=True: Return updated cache for next step
         """
         seq_len, batch_size = tokens_seq.shape
         if seq_len > self.block_size:
@@ -556,19 +758,40 @@ class TransformerModel(nn.Module):
         
         # Add positional embeddings if enabled
         if self.pos_emb is not None:
-            pos = torch.arange(seq_len, device=tokens_seq.device).unsqueeze(0)  # (1, seq_len)
+            # For cached generation, position starts from cache_len
+            if kv_cache is not None and len(kv_cache) > 0:
+                cache_len = kv_cache[0]['k'].size(2)  # Get cached sequence length
+                pos_start = cache_len
+            else:
+                pos_start = 0
+            
+            pos = torch.arange(pos_start, pos_start + seq_len, device=tokens_seq.device).unsqueeze(0)  # (1, seq_len)
+            pos = pos % self.block_size # NEW: Ensure pos is within bounds for KV cache
             x = x + self.pos_emb(pos)  # Broadcast and add
         
-        # Pass through all Transformer blocks
-        for blk in self.blocks:
-            x = blk(x, causal_mask=self.causal_mask)  # Apply causal masking
+        # Pass through all Transformer blocks with optional caching
+        new_kv_cache: list = [] if use_cache else None  # type: ignore
+        
+        for i, blk in enumerate(self.blocks):
+            # Get cache for this layer if available
+            layer_cache = kv_cache[i] if (kv_cache is not None and i < len(kv_cache)) else None
+            
+            if use_cache:
+                x, updated_cache = blk(x, causal_mask=self.causal_mask, kv_cache=layer_cache, use_cache=True)
+                new_kv_cache.append(updated_cache)  # type: ignore
+            else:
+                x = blk(x, causal_mask=self.causal_mask, kv_cache=layer_cache, use_cache=False)
         
         # Final norm and projection
         x = self.final_norm(x)
         logits = self.lm_head(x)  # (batch, seq_len, vocab_size)
         
         # Transpose back to (seq_len, batch, vocab_size) for consistency with LSTM/K-gram
-        return logits.transpose(0, 1)
+        logits_out = logits.transpose(0, 1)
+        
+        if use_cache:
+            return logits_out, new_kv_cache
+        return logits_out
 
 
 ################################################################################
@@ -669,7 +892,7 @@ def nucleus_sampling(logits, p=0.95):
 
     # Find cutoff: smallest set with cumulative mass >= p
     cutoff_idx = torch.searchsorted(cumulative, torch.tensor(p, device=logits.device))
-    cutoff_idx = torch.clamp(cutoff_idx, min=1)  # Ensure at least 1 token (avoid empty nucleus)
+    cutoff_idx = torch.clamp(cutoff_idx, min=1, max=len(sorted_probs))  # Ensure valid range
 
     # Extract nucleus (top tokens within threshold)
     kept_probs = sorted_probs[:cutoff_idx]
@@ -679,108 +902,354 @@ def nucleus_sampling(logits, p=0.95):
     kept_probs = kept_probs / kept_probs.sum()
     
     # Sample from nucleus
-    sampled_pos = torch.multinomial(kept_probs, num_samples=1).item()
-    return kept_indices[sampled_pos].item() # type: ignore
+    sampled_pos = int(torch.multinomial(kept_probs, num_samples=1).item())
+    chosen_idx = int(kept_indices[sampled_pos].item())
+    
+    # Safety: clamp to valid vocab range
+    vocab_size = logits.shape[0]
+    return int(max(0, min(chosen_idx, vocab_size - 1)))
 
 
-def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
-                  top_p=None,
-                  monosemantic_info=None,
-                  do_monosemantic=False):
+def generate_text_with_thinking(
+    model, enc, init_text,
+    max_thinking_tokens=800,
+    max_answer_tokens=200,
+    device="cpu",
+    top_p=None,
+    temperature=1.0,
+    repetition_penalty=1.0
+):
     """
-    Autoregressive text generation: Unified interface for all models.
+    Thinking-aware text generation for reasoning models.
     
-    ALGORITHM (for each new token):
-    1. Encode current text to token sequence
-    2. Feed entire sequence through model: (seq_len, 1) -> (seq_len, 1, vocab_size)
-    3. Extract logits at last position: logits[-1, 0, :]
-    4. Sample next token (greedy or top-p)
-    5. Append to sequence and repeat
+    Generates text in two phases:
+    1. THINKING PHASE: Generate up to max_thinking_tokens until </thinking> appears
+    2. ANSWER PHASE: Generate up to max_answer_tokens for the final answer
     
-    WHY FEED ENTIRE SEQUENCE?
-    - LSTM needs full context to build hidden state
-    - Transformer uses causal masking (only attends to previous positions)
-    - K-gram only uses last k tokens internally
-    - Unified interface simplifies code
+    This allows models to use generous thinking budgets without limiting answer quality.
     
-    OPTIMIZATION OPPORTUNITIES:
-    - KV-caching for Transformer (reuse past attention keys/values)
-    - Hidden state passing for LSTM (don't recompute from scratch)
-    - Currently regenerates entire forward pass each step (simple but slow)
+    SPECIAL TOKENS:
+    - <thinking>: Marks start of reasoning (usually in prompt)
+    - </thinking>: Marks end of reasoning (model generates this)
+    - <answer>: Marks start of final answer
+    
+    EXAMPLE:
+        Input:  "Q: 2+2=? A: <thinking>"
+        Output: "1. Need to add 2 and 2\n2. 2+2=4</thinking><answer>4</answer> #### 4"
+                 |<------ up to 800 tokens ------>|<----- up to 200 tokens ---->|
     
     PARAMETERS:
-    - model: Neural network (LSTM, Transformer, or K-gram MLP)
+    - model: Neural network (Transformer recommended)
     - enc: Tokenizer (tiktoken GPT-2 BPE)
-    - init_text: Prompt string to continue from
-    - max_new_tokens: How many tokens to generate
+    - init_text: Prompt (should contain "<thinking>" to trigger thinking mode)
+    - max_thinking_tokens: Token budget for thinking phase (default: 800)
+    - max_answer_tokens: Token budget for answer phase (default: 200)
     - device: "cpu" or "cuda:0"
-    - top_p: None for greedy (argmax), float in (0, 1] for nucleus sampling
-    - monosemantic_info: Optional interpretability data (currently unused)
-    - do_monosemantic: Whether to run interpretability analysis
+    - top_p: Nucleus sampling parameter (None for greedy)
+    - temperature: Sampling temperature (1.0 = no change)
+    - repetition_penalty: Penalize repeated tokens
     
     RETURNS:
-    - final_text: Full generated text (prompt + new tokens)
-    - annotated_text: Text with interpretability annotations (if enabled)
+    - (final_text, phase_info) where phase_info contains:
+        {
+            "thinking_tokens": int,
+            "answer_tokens": int,
+            "phase_switch": bool  # True if </thinking> was generated
+        }
+    """
+    # Special tokens
+    THINKING_START = "<thinking>"
+    THINKING_END = "</thinking>"
+    ANSWER_START = "<answer>"
+    
+    # Encode special tokens
+    thinking_end_tokens = enc.encode(THINKING_END)
+    
+    was_training = model.training
+    model.eval()
+    
+    # Check for KV-cache support
+    use_kv_cache = isinstance(model, TransformerModel)
+    kv_cache = None
+    
+    with torch.no_grad():
+        context_tokens = enc.encode(init_text)
+        
+        # Validate context tokens against model vocabulary
+        model_vocab_size = getattr(model, 'vocab_size', enc.n_vocab)
+        if hasattr(model, 'embed') and hasattr(model.embed, 'weight'):
+             model_vocab_size = model.embed.weight.shape[0]
+             
+        # Check for out-of-bounds tokens in prompt
+        if any(t >= model_vocab_size or t < 0 for t in context_tokens):
+            print(f"Warning: Prompt contains tokens outside model vocab size [0, {model_vocab_size-1}]. Clamping.")
+            context_tokens = [min(max(t, 0), model_vocab_size - 1) for t in context_tokens]
+        
+        # Determine initial phase based on prompt
+        prompt_text = init_text.lower()
+        
+        # Determine initial phase based on prompt
+        prompt_text = init_text.lower()
+        if THINKING_START.lower() in prompt_text:
+            phase = "thinking"
+        else:
+            phase = "answer"  # No thinking mode
+        
+        thinking_count = 0
+        answer_count = 0
+        phase_switched = False
+        
+        block_size = getattr(model, 'block_size', None)
+        max_total_tokens = max_thinking_tokens + max_answer_tokens
+        
+        # Initial forward pass
+        if use_kv_cache:
+            # Process full prompt to prime cache
+            seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1) # (seq, 1)
+            logits_seq, kv_cache = model(seq_tensor, kv_cache=None, use_cache=True)
+            next_logits = logits_seq[-1, 0, :]
+        else:
+            # Will be computed in loop
+            pass
+
+        for step_i in range(max_total_tokens):
+            # Check phase limits
+            if phase == "thinking" and thinking_count >= max_thinking_tokens:
+                # Force close thinking block
+                tokens_to_add = thinking_end_tokens
+                for token in tokens_to_add:
+                    context_tokens.append(token)
+                    if use_kv_cache:
+                        inp = torch.tensor([[token]], dtype=torch.long, device=device).transpose(0, 1) # (1, 1)
+                        _, kv_cache = model(inp, kv_cache=kv_cache, use_cache=True)
+                
+                phase = "answer"
+                phase_switched = True
+                thinking_count = 0
+                
+                # Update next_logits for the last added token
+                if use_kv_cache:
+                    seq_tensor = torch.tensor(tokens_to_add, dtype=torch.long, device=device).unsqueeze(1)
+                    logits_seq, kv_cache = model(seq_tensor, kv_cache=kv_cache, use_cache=True)
+                    next_logits = logits_seq[-1, 0, :]
+                     
+                continue
+            
+            if phase == "answer" and answer_count >= max_answer_tokens:
+                break  # Done generating
+            
+            # Prepare input for this step
+            if use_kv_cache:
+                pass
+            else:
+                # Truncate context to fit block_size
+                if block_size is not None and len(context_tokens) >= block_size:
+                    inp_tokens = context_tokens[-(block_size - 1):]
+                else:
+                    inp_tokens = context_tokens
+                
+                # Forward pass
+                seq_tensor = torch.tensor(inp_tokens, dtype=torch.long, device=device).unsqueeze(1)
+                logits_seq = model(seq_tensor)
+                next_logits = logits_seq[-1, 0, :]
+            
+            # Apply temperature
+            if temperature != 1.0:
+                next_logits = next_logits / temperature
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                for token in set(context_tokens[-50:]):
+                    # Ensure next_logits is a tensor before indexing
+                    if isinstance(next_logits, torch.Tensor) and token < len(next_logits):
+                        next_logits[token] /= repetition_penalty
+            
+            # Sample next token
+            vocab_size = model_vocab_size
+            if top_p is None:
+                # Ensure next_logits is a tensor
+                if not isinstance(next_logits, torch.Tensor):
+                     # This should not happen if logic is correct, but for safety
+                     next_logits = torch.tensor(next_logits, device=device)
+                
+                # Explicitly cast to Tensor for type checker
+                logits_tensor: torch.Tensor = next_logits # type: ignore
+                chosen_token = int(torch.argmax(logits_tensor).item())
+            else:
+                chosen_token = nucleus_sampling(next_logits, p=top_p)
+            
+            chosen_token = max(0, min(chosen_token, vocab_size - 1))
+            context_tokens.append(chosen_token)
+            
+            # Update KV Cache / Compute next logits for NEXT iteration
+            if use_kv_cache:
+                inp = torch.tensor([[chosen_token]], dtype=torch.long, device=device).transpose(0, 1) # (1, 1)
+                # Clamp input token to valid range before passing to model
+                inp = torch.clamp(inp, 0, model_vocab_size - 1)
+                logits_seq, kv_cache = model(inp, kv_cache=kv_cache, use_cache=True)
+                next_logits = logits_seq[-1, 0, :]
+            
+            # EARLY STOPPING: Check for token repetition (prevents !!!! spam)
+            init_len = len(enc.encode(init_text))
+            if len(context_tokens) > init_len + 10:
+                # Check last 5 tokens for repetition
+                last_5 = context_tokens[-5:]
+                if len(set(last_5)) == 1:  # All same token
+                    break
+                # Check last 10 tokens - if >7 are the same, stop
+                if len(context_tokens) >= 10:
+                    last_10 = context_tokens[-10:]
+                    most_common = max(set(last_10), key=last_10.count)
+                    if last_10.count(most_common) >= 7:
+                        break
+            
+            # Check for natural completion in answer phase
+            if phase == "answer":
+                # Decode recent output to check for completion
+                recent_text = enc.decode(context_tokens[max(0, len(context_tokens)-30):])
+                if "####" in recent_text:
+                    # Extract text after ####
+                    after_hash = recent_text.split("####")[-1].strip()
+                    if after_hash:
+                        # Stop if we see newline or repeated punctuation
+                        if '\n' in after_hash or after_hash.count('!') >= 3:
+                            break
+                        # Stop if we have a clean number followed by extra text
+                        first_word = after_hash.split()[0] if after_hash.split() else ""
+                        if first_word.replace('.','').replace('-','').isdigit():
+                            if len(after_hash) > len(first_word) + 2:
+                                break
+            
+            # Update phase counters
+            if phase == "thinking":
+                thinking_count += 1
+            else:
+                answer_count += 1
+            
+            # Check for phase transition (</thinking> token sequence)
+            if phase == "thinking" and len(context_tokens) >= len(thinking_end_tokens):
+                # Check if we just generated </thinking>
+                recent_tokens = context_tokens[-len(thinking_end_tokens):]
+                if recent_tokens == thinking_end_tokens:
+                    phase = "answer"
+                    phase_switched = True
+                    answer_count = 0  # Reset counter for answer phase
+    
+    model.train(was_training)
+    
+    final_text = enc.decode(context_tokens)
+    phase_info = {
+        "thinking_tokens": thinking_count,
+        "answer_tokens": answer_count,
+        "phase_switched": phase_switched
+    }
+    
+    return final_text, phase_info
+
+
+def generate_text(model, enc, init_text, max_new_tokens=100, device="cpu", top_p=None, temperature=1.0):
+    """
+    Generate text from a prompt using the trained model.
+    
+    Supports:
+    - KV-caching for Transformer models (faster generation)
+    - Nucleus (top-p) sampling
+    - Temperature scaling
+    
+    PARAMETERS:
+    - model: Trained model (Transformer, LSTM, or K-gram)
+    - enc: Tokenizer (tiktoken)
+    - init_text: Prompt string
+    - max_new_tokens: Number of tokens to generate
+    - device: "cpu" or "cuda:0"
+    - top_p: Nucleus sampling threshold (None for greedy)
+    - temperature: Sampling temperature (1.0 = no change)
+    
+    RETURNS:
+    - generated_text: Full text (prompt + generated)
+    - tokens: List of token IDs
     """
     was_training = model.training
-    model.eval()  # Disable dropout, set batch norm to eval mode
+    model.eval()
     
-    with torch.no_grad():  # Disable gradient computation (faster, less memory)
-        # Tokenize initial prompt
+    with torch.no_grad():
         context_tokens = enc.encode(init_text)
-        annotation_list = []
+        
+        # Validate context tokens against model vocabulary
+        model_vocab_size = getattr(model, 'vocab_size', enc.n_vocab)
+        if hasattr(model, 'embed') and hasattr(model.embed, 'weight'):
+             model_vocab_size = model.embed.weight.shape[0]
 
-        # Generate tokens one at a time (autoregressive)
-        for step_i in range(max_new_tokens):
-            # Convert token list to tensor: (seq_len, 1)
-            seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1)
+        # Check for out-of-bounds tokens in prompt
+        if any(t >= model_vocab_size or t < 0 for t in context_tokens):
+            print(f"Warning: Prompt contains tokens outside model vocab size [0, {model_vocab_size-1}]. Clamping.")
+            context_tokens = [min(max(t, 0), model_vocab_size - 1) for t in context_tokens]
+        
+        # Check if model supports KV-caching (Transformer only)
+        use_kv_cache = isinstance(model, TransformerModel)
+        kv_cache = None
+        
+        # For KV-cache, we process the full prompt once, then token-by-token
+        # For non-KV models, we re-process the full context every step
+        
+        # Initial processing
+        if use_kv_cache:
+            # Process prompt to fill cache
+            seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1) # (seq, 1)
+            logits, kv_cache = model(seq_tensor, kv_cache=None, use_cache=True)
+            next_logits = logits[-1, 0, :] # Last token's logits
+        else:
+            # Will be processed in loop
+            pass
             
-            # Forward pass: get logits for all positions
-            logits_seq = model(seq_tensor)  # (seq_len, 1, vocab_size)
-            
-            # Extract logits for next token (at last position)
-            next_logits = logits_seq[-1, 0, :]  # (vocab_size,)
+        for _ in range(max_new_tokens):
+            # Prepare input for this step
+            if use_kv_cache and kv_cache is not None:
+                pass
+            else:
+                # Truncate context to fit block_size
+                block_size = getattr(model, 'block_size', None)
+                if block_size is not None and len(context_tokens) >= block_size:
+                    input_tokens = context_tokens[-(block_size - 1):]
+                else:
+                    input_tokens = context_tokens
+                
+                seq_tensor = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(1)
+                logits = model(seq_tensor)
+                next_logits = logits[-1, 0, :]
+
+            # Apply temperature
+            if temperature != 1.0:
+                next_logits = next_logits / temperature
 
             # Sample next token
+            vocab_size = model_vocab_size
             if top_p is None:
-                # Greedy decoding: always pick most likely token
-                chosen_token = torch.argmax(next_logits).item()
+                # Greedy
+                # Ensure next_logits is a tensor
+                if not isinstance(next_logits, torch.Tensor):
+                     next_logits = torch.tensor(next_logits, device=device)
+                
+                logits_tensor: torch.Tensor = next_logits # type: ignore
+                chosen_token = int(torch.argmax(logits_tensor).item())
             else:
-                # Nucleus sampling: sample from top-p probability mass
+                # Nucleus
                 chosen_token = nucleus_sampling(next_logits, p=top_p)
-
-            # Append to context
+            
+            chosen_token = max(0, min(chosen_token, vocab_size - 1))
             context_tokens.append(chosen_token)
-
-            # Optional: Monosemantic analysis (interpretability stub)
-            if do_monosemantic and monosemantic_info is not None:
-                neighbors = monosemantic_analysis_for_token(
-                    chosen_token, model, monosemantic_info, enc, device=device, top_n=5
-                )
-                annotation_list.append((chosen_token, neighbors))
-            else:
-                annotation_list.append((chosen_token, []))
-
-    # Restore training mode if it was on
-    model.train(was_training)
-
-    # Decode final sequence
-    final_text = enc.decode(context_tokens)
+            
+            # Prepare for next step (KV cache update)
+            if use_kv_cache:
+                inp = torch.tensor([[chosen_token]], dtype=torch.long, device=device).transpose(0, 1) # (1, 1)
+                # Clamp input token to valid range before passing to model
+                inp = torch.clamp(inp, 0, model_vocab_size - 1)
+                logits, kv_cache = model(inp, kv_cache=kv_cache, use_cache=True)
+                next_logits = logits[-1, 0, :]
     
-    # Build annotated text (with interpretability info if available)
-    prefix_text = enc.decode(context_tokens[:-max_new_tokens])
-    annotated_strs = [prefix_text]
-    for (tid, neighs) in annotation_list:
-        token_str = enc.decode([tid])
-        if neighs:
-            neighbor_strs = [f"{enc.decode([x[1]])}" for x in neighs]
-            annotated = f"{token_str}[NN={neighbor_strs}]"
-        else:
-            annotated = token_str
-        annotated_strs.append(annotated)
-
-    annotated_text = "".join(annotated_strs)
-    return final_text, annotated_text
+    model.train(was_training)
+    generated_text = enc.decode(context_tokens)
+    return generated_text, context_tokens
 
 
 ################################################################################
@@ -802,7 +1271,12 @@ def train_one_model(model,
                     prompt="Once upon a",
                     grad_clip=1.0,
                     weight_decay=0.01,
-                    val_loader=None):
+                    val_loader=None,
+                    checkpoint_dir: str = ".",
+                    lr_schedule: str = "none",
+                    lr_warmup_steps: int = 200,
+                    lr_min_ratio: float = 0.1,
+                    sample_every_steps: int = 0):
     """
     Train a single model (LSTM, Transformer, or K-gram MLP) on the provided data.
     
@@ -822,6 +1296,11 @@ def train_one_model(model,
         grad_clip: Gradient clipping norm to prevent exploding gradients
         weight_decay: L2 regularization strength (AdamW)
         val_loader: Optional validation DataLoader
+        checkpoint_dir: Directory to save checkpoints and loss histories
+        lr_schedule: Learning-rate schedule for faster training: none|cosine|linear
+        lr_warmup_steps: Warmup steps for LR schedule
+        lr_min_ratio: Min LR as a fraction of base LR for cosine/linear decay
+        sample_every_steps: If >0, generate sample text every N training steps (overrides --sample_interval_seconds)
     
     Returns:
         (train_loss_history, val_loss_history): Tuples of (global_step, loss) for plotting
@@ -840,8 +1319,44 @@ def train_one_model(model,
     elif warmup=='no':
         optimizer = optim.SGD(model.parameters(), lr=lr)
     else:
-        # Use AdamW optimizer
-        optimizer = optim.AdamW(model.parameters(), lr=lr)
+        # Use AdamW optimizer with improved hyperparameters
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            betas=(0.9, 0.95),  # Lower beta2 for better convergence
+            weight_decay=weight_decay,
+            eps=1e-8
+        )
+
+    # ===== LR scheduler (for AdamW runs) =====
+    # Note: the existing --warmup flag uses SGD (optionally with warmup). We keep that behavior.
+    # For AdamW (default), we add an optional warmup+decay schedule.
+    total_steps = None
+    if max_steps_per_epoch is not None:
+        total_steps = epochs * max_steps_per_epoch
+    else:
+        total_steps = epochs * len(loader)
+
+    lr_sched = None
+    if warmup not in ['yes', 'no'] and lr_schedule != "none":
+        def lr_lambda(step: int) -> float:
+            # warmup
+            if lr_warmup_steps > 0 and step < lr_warmup_steps:
+                return float(step) / float(max(1, lr_warmup_steps))
+
+            # decay starts after warmup
+            t = max(0, step - lr_warmup_steps)
+            T = max(1, total_steps - lr_warmup_steps)
+            progress = min(1.0, float(t) / float(T))
+
+            min_lr = max(0.0, min(1.0, lr_min_ratio))
+
+            if lr_schedule == "linear":
+                return (1.0 - progress) * (1.0 - min_lr) + min_lr
+            # cosine
+            return min_lr + 0.5 * (1.0 - min_lr) * (1.0 + math.cos(math.pi * progress))
+
+        lr_sched = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # Track timing for periodic text generation
     start_time = time.time()
@@ -851,6 +1366,11 @@ def train_one_model(model,
     # Track loss history for plotting
     train_loss_history = []
     val_loss_history = []
+    
+    # Early stopping variables
+    best_val_loss = float('inf')
+    patience = 3  # Stop if no improvement for 3 epochs
+    patience_counter = 0
 
     for epoch in range(1, epochs + 1):
         model.train()  # Set model to training mode (enables dropout, etc.)
@@ -877,10 +1397,15 @@ def train_one_model(model,
             optimizer.zero_grad()
             loss.backward()
             
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            
             # Update model parameters
             optimizer.step()
-            if warmup=='yes':
+            if warmup == 'yes':
                 scheduler.step()
+            elif lr_sched is not None:
+                lr_sched.step()
 
             # Track loss statistics
             total_loss += loss.item()
@@ -893,24 +1418,44 @@ def train_one_model(model,
             # Log training progress at regular intervals
             if batch_idx % log_steps == 0:
                 avg_part_loss = partial_loss / partial_count
+                
+                # Calculate gradient norm for monitoring stability
+                total_grad_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_grad_norm += param_norm.item() ** 2
+                total_grad_norm = total_grad_norm ** 0.5
+                
+                # Get current learning rate
+                current_lr = optimizer.param_groups[0]['lr']
+                
                 print(f"[{model_name}] Epoch {epoch}/{epochs}, "
                       f"Step {batch_idx}/{len(loader)} (global step: {global_step}) "
-                      f"Partial Avg Loss: {avg_part_loss:.4f}")
+                      f"Loss: {avg_part_loss:.4f}, "
+                      f"Grad_norm: {total_grad_norm:.3f}, "
+                      f"LR: {current_lr:.2e}")
                 # Reset partial counters
                 partial_loss = 0.0
                 partial_count = 0
 
             # Generate text samples periodically to monitor quality
-            current_time = time.time()
-            if current_time >= next_sample_time and enc is not None:
-                with torch.no_grad():  # Disable gradients for faster generation
+            do_sample = False
+            if enc is not None:
+                if sample_every_steps and (global_step % sample_every_steps == 0):
+                    do_sample = True
+                else:
+                    current_time = time.time()
+                    if current_time >= next_sample_time:
+                        do_sample = True
+            
+            if do_sample and enc is not None:
+                with torch.no_grad():
                     # Generate using greedy decoding (always pick most likely token)
                     print(f"\n[{model_name}] Generating sample text (greedy) at epoch={epoch}, step={batch_idx}...")
                     text_greedy, ann_greedy = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=str(device),
-                        top_p=None,  # None = greedy
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        top_p=None  # None = greedy
                     )
                     print(f" Greedy Sample: {text_greedy}")
                     print(f" Annotated: {ann_greedy}\n")
@@ -919,9 +1464,7 @@ def train_one_model(model,
                     print(f"[{model_name}] Generating sample text (top-p=0.95) at epoch={epoch}, step={batch_idx}...")
                     text_topp, ann_topp = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=str(device),
-                        top_p=0.95,  # Keep top 95% probability mass
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        top_p=0.95  # Keep top 95% probability mass
                     )
                     print(f" Top-p (p=0.95) Sample: {text_topp}")
                     print(f" Annotated: {ann_topp}\n")
@@ -930,15 +1473,14 @@ def train_one_model(model,
                     print(f"[{model_name}] Generating sample text (top-p=1.0) at epoch={epoch}, step={batch_idx}...")
                     text_topp1, ann_topp1 = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=str(device),
-                        top_p=1.0,  # Sample from entire distribution
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        top_p=1.0  # Sample from entire distribution
                     )
                     print(f" Top-p (p=1.0) Sample: {text_topp1}")
                     print(f" Annotated: {ann_topp1}\n")
 
-                # Schedule next sampling time
-                next_sample_time = current_time + sample_interval
+                # Schedule next sampling time (time-based mode)
+                if not sample_every_steps:
+                    next_sample_time = time.time() + sample_interval
 
             # Early stopping if max steps reached (useful for quick testing)
             if max_steps_per_epoch is not None and step_in_epoch >= max_steps_per_epoch:
@@ -973,7 +1515,9 @@ def train_one_model(model,
             model.train()  # Back to training mode
 
         # Save model checkpoint after each epoch (allows resuming training)
-        checkpoint_path = f"{model_name}_epoch{epoch}.pt"
+        import os
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}_epoch{epoch}.pt")
         torch.save(model.state_dict(), checkpoint_path)
         print(f"Saved {model_name} weights to {checkpoint_path}")
     
@@ -999,9 +1543,10 @@ def main():
     warmup = args.warmup # Enable SGD, toggle warmup
 
     block_size = args.block_size  # Maximum sequence length
-    train_subset_size = 20000
+    train_subset_size = args.tinystories_train_subset_size
     log_interval_steps = 100  # Print loss every N steps
-    sample_interval_seconds = 30 # Generate text every N seconds
+    sample_interval_seconds = args.sample_interval_seconds
+    sample_every_steps = args.sample_every_steps
 
     max_steps_per_epoch = args.max_steps_per_epoch  # Optional cap on training steps
     num_inner_layers = args.num_inner_mlp_layers  # Depth of k-gram MLP
@@ -1015,6 +1560,8 @@ def main():
         device = torch.device(requested_device_id)
 
     print(f"Using device: {device}, block_size={block_size}, kgram_k={k}, chunk_size={chunk_size}, embed_size={embed_size}")
+
+    checkpoint_dir = args.checkpoint_dir
 
     ############################################################################
     # Data Loading and Tokenization
@@ -1052,15 +1599,61 @@ def main():
         for filepath in args.input_files:
             print(f"Reading custom text file: {filepath}")
             with open(filepath, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            for line in lines:
-                line = line.strip()  # Remove whitespace
-                if not line:  # Skip empty lines
-                    continue
-                tokens = enc.encode(line)
-                tokens = tokens[:block_size]
-                if len(tokens) > 0:
-                    other_seqs.append(tokens)
+                content = f.read()
+            
+            # Check if file contains multi-line thinking blocks (look for <thinking> tags)
+            if "<thinking>" in content:
+                print(f"  Detected multi-line format with <thinking> blocks")
+                # Parse multi-line blocks: each problem starts with "Q:" and ends before next "Q:"
+                blocks = []
+                lines = content.split('\n')
+                current_block = []
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Start of new problem
+                    if line.startswith('Q:'):
+                        # Save previous block if exists
+                        if current_block:
+                            full_text = ' '.join(current_block)
+                            blocks.append(full_text)
+                        current_block = [line]
+                    else:
+                        # Continue current block
+                        current_block.append(line)
+                
+                # Don't forget last block
+                if current_block:
+                    full_text = ' '.join(current_block)
+                    blocks.append(full_text)
+                
+                print(f"  Parsed {len(blocks)} complete reasoning blocks")
+                
+                # Tokenize complete blocks
+                for block_text in blocks:
+                    tokens = enc.encode(block_text)
+                    # For thinking blocks: take LAST block_size tokens (keeps answer at end)
+                    if len(tokens) > block_size:
+                        tokens = tokens[-block_size:]
+                    if len(tokens) > 0:
+                        other_seqs.append(tokens)
+            else:
+                # Single-line format (original behavior)
+                print(f"  Using single-line format")
+                lines = content.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    tokens = enc.encode(line)
+                    if len(tokens) > block_size:
+                        tokens = tokens[-block_size:]
+                    if len(tokens) > 0:
+                        other_seqs.append(tokens)
+        
         print(f"Custom input files: {len(other_seqs)} sequences loaded.")
     else:
         print("No custom input files provided.")
@@ -1150,6 +1743,16 @@ def main():
             ff_mult=args.ff_mult,
             use_pos_emb=not args.no_pos_emb
         ).to(device)
+
+        # Optional: initialize from checkpoint (finetuning)
+        if args.init_from:
+            import os
+            if not os.path.exists(args.init_from):
+                raise FileNotFoundError(f"--init_from checkpoint not found: {args.init_from}")
+            print(f"Loading Transformer weights from --init_from: {args.init_from}")
+            state = torch.load(args.init_from, map_location=device)
+            transformer.load_state_dict(state)
+
         models["transformer"] = transformer
 
     ############################################################################
@@ -1187,11 +1790,17 @@ def main():
             warmup=warmup,
             log_steps=log_interval_steps,
             sample_interval=sample_interval_seconds,
+            sample_every_steps=sample_every_steps,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
-            monosemantic_info=monosemantic_info,
-            prompt=args.prompt,  # user-specified prompt here
-            val_loader=val_loader  # Pass validation loader
+            prompt=args.prompt,
+            grad_clip=args.grad_clip,
+            weight_decay=args.weight_decay,
+            val_loader=val_loader,
+            checkpoint_dir=checkpoint_dir,
+            lr_schedule=args.lr_schedule,
+            lr_warmup_steps=args.lr_warmup_steps,
+            lr_min_ratio=args.lr_min_ratio,
         )
         
         # Store loss histories (both train and val)
@@ -1244,7 +1853,7 @@ def main():
         transformer_model = models["transformer"]
         # enable caching
         for blk in transformer_model.blocks:
-            blk.save_attention = True
+            blk.save_attention = True # type: ignore
         with torch.no_grad():
             tok = torch.tensor(enc.encode(args.prompt), dtype=torch.long, device=device).unsqueeze(1)
             _ = transformer_model(tok)
@@ -1272,14 +1881,17 @@ def main():
                 plt.close()
         # disable caching
         for blk in transformer_model.blocks:
-            blk.save_attention = False
+            blk.save_attention = False # type: ignore
 
     # Save loss histories for plotting
     import pickle
-    with open("loss_histories.pkl", "wb") as f:
+    import os
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    loss_path = os.path.join(checkpoint_dir, "loss_histories.pkl")
+    with open(loss_path, "wb") as f:
         pickle.dump(all_loss_histories, f)
-    print("\n✅ Saved loss histories to loss_histories.pkl")
-    print("Run 'python plot_losses.py' to visualize training curves!")
+    print(f"\n✅ Saved loss histories to {loss_path}")
+    print("Run 'python plot_losses.py --input <that_file>' to visualize training curves!")
     
     # Finally, let's share how I'm feeling:
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
